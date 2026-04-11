@@ -23,12 +23,19 @@ Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **Rea
    - [Backend `.env`](#backend-env)
    - [Frontend `frontend/.env`](#frontend-frontendenv)
 7. [Running the Stack](#running-the-stack)
-8. [Running Tests](#running-tests)
-9. [Authentication Reference](#authentication-reference)
-10. [Kubernetes RBAC](#kubernetes-rbac)
-11. [Security Controls](#security-controls)
-12. [Troubleshooting](#troubleshooting)
-13. [Project Structure](#project-structure)
+8. [Kubernetes Deployment (Docker + Helm)](#kubernetes-deployment-docker--helm)
+   - [Prerequisites for Kubernetes](#prerequisites-for-kubernetes)
+   - [Build and Push Docker Images](#build-and-push-docker-images)
+   - [Deploy with Helm](#deploy-with-helm)
+   - [Azure Workload Identity (Recommended)](#azure-workload-identity-recommended)
+   - [Service Principal Authentication](#service-principal-authentication)
+   - [Helm Values Reference](#helm-values-reference)
+9. [Running Tests](#running-tests)
+10. [Authentication Reference](#authentication-reference)
+11. [Kubernetes RBAC](#kubernetes-rbac)
+12. [Security Controls](#security-controls)
+13. [Troubleshooting](#troubleshooting)
+14. [Project Structure](#project-structure)
 
 ---
 
@@ -499,6 +506,375 @@ asyncio.run(main())
 
 ---
 
+## Kubernetes Deployment (Docker + Helm)
+
+This section covers building Docker images, pushing them to a registry, and deploying the full stack to AKS using the included Helm chart.
+
+---
+
+### Prerequisites for Kubernetes
+
+In addition to the base prerequisites you will also need:
+
+| Tool | Minimum version | Notes |
+|------|----------------|-------|
+| Docker | 24 | Build and push images |
+| Helm | 3.12 | Deploy the Helm chart |
+| A container registry | — | Azure Container Registry (ACR) recommended |
+
+Install Helm:
+
+```bash
+# macOS
+brew install helm
+
+# Linux
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Verify
+helm version
+```
+
+---
+
+### Build and Push Docker Images
+
+#### 1. Log in to Azure Container Registry
+
+```bash
+# Replace <registry-name> with your ACR name (e.g. mycompanyacr)
+az acr login --name <registry-name>
+```
+
+#### 2. Build and push the backend image
+
+The backend Dockerfile lives at `aks-health-mcp/Dockerfile`.
+
+```bash
+cd aks-health-mcp
+
+docker build \
+  -t <registry-name>.azurecr.io/aks-health-backend:1.0.0 \
+  -f Dockerfile \
+  .
+
+docker push <registry-name>.azurecr.io/aks-health-backend:1.0.0
+```
+
+#### 3. Build and push the frontend image
+
+The frontend requires `VITE_*` values to be baked in at build time via Docker `--build-arg`:
+
+```bash
+docker build \
+  -t <registry-name>.azurecr.io/aks-health-frontend:1.0.0 \
+  -f frontend/Dockerfile \
+  --build-arg VITE_AZURE_AD_CLIENT_ID=<your-client-id> \
+  --build-arg VITE_AZURE_AD_TENANT_ID=<your-tenant-id> \
+  --build-arg VITE_AZURE_AD_ALLOWED_GROUP=<your-group-id> \
+  --build-arg VITE_API_BASE_URL=https://aks-health.contoso.com \
+  --build-arg VITE_APP_NAME="AKS Health Dashboard" \
+  frontend/
+
+docker push <registry-name>.azurecr.io/aks-health-frontend:1.0.0
+```
+
+> **Note:** `VITE_API_BASE_URL` should match the hostname you configure in `ingress.host`. In local testing you can leave it blank — Vite's dev proxy handles the `/api` routing.
+
+---
+
+### Deploy with Helm
+
+#### 1. Attach ACR to your AKS cluster
+
+This allows the cluster to pull images from your registry without a pull secret:
+
+```bash
+az aks update \
+  --name <cluster-name> \
+  --resource-group <resource-group> \
+  --attach-acr <registry-name>
+```
+
+#### 2. Connect kubectl to the cluster
+
+```bash
+az aks get-credentials \
+  --resource-group <resource-group> \
+  --name <cluster-name>
+```
+
+#### 3. Create a values override file
+
+Create a file called `my-values.yaml` (do **not** commit it — it contains sensitive values):
+
+```yaml
+backend:
+  image:
+    repository: <registry-name>.azurecr.io/aks-health-backend
+    tag: "1.0.0"
+  config:
+    azureTenantId: "00000000-0000-0000-0000-000000000000"       # your tenant ID
+    azureSubscriptionIds: "11111111-1111-1111-1111-111111111111" # your subscription ID(s)
+    azureFoundryEndpoint: "https://<project>.services.ai.azure.com/models"
+    azureFoundryModel: "gpt-4o"
+    azureAdAppClientId: "22222222-2222-2222-2222-222222222222"  # app registration client ID
+    azureAdAllowedGroup: "33333333-3333-3333-3333-333333333333"  # AD group object ID
+    frontendOrigin: "https://aks-health.contoso.com"            # your frontend URL
+
+frontend:
+  image:
+    repository: <registry-name>.azurecr.io/aks-health-frontend
+    tag: "1.0.0"
+
+ingress:
+  enabled: true
+  className: "nginx"
+  host: "aks-health.contoso.com"
+  tls:
+    enabled: true
+    secretName: "aks-health-tls"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+serviceAccount:
+  create: true
+```
+
+#### 4. Install the Helm chart
+
+```bash
+helm install aks-health ./helm/aks-health \
+  --namespace aks-health \
+  --create-namespace \
+  --values my-values.yaml
+```
+
+#### 5. Verify the deployment
+
+```bash
+# Watch pods come up
+kubectl -n aks-health get pods -w
+
+# Check services
+kubectl -n aks-health get svc
+
+# Check ingress
+kubectl -n aks-health get ingress
+
+# View backend logs
+kubectl -n aks-health logs -l app.kubernetes.io/component=backend -f
+
+# View frontend logs
+kubectl -n aks-health logs -l app.kubernetes.io/component=frontend -f
+```
+
+#### Upgrading
+
+After building a new image, upgrade the release:
+
+```bash
+helm upgrade aks-health ./helm/aks-health \
+  --namespace aks-health \
+  --values my-values.yaml \
+  --set backend.image.tag=1.1.0 \
+  --set frontend.image.tag=1.1.0
+```
+
+#### Uninstalling
+
+```bash
+helm uninstall aks-health --namespace aks-health
+```
+
+---
+
+### Azure Workload Identity (Recommended)
+
+Workload Identity lets the backend pod authenticate to Azure APIs using a Managed Identity — no client secret stored anywhere. This is the recommended production setup.
+
+#### Step 1 — Enable Workload Identity on your AKS cluster
+
+```bash
+az aks update \
+  --name <cluster-name> \
+  --resource-group <resource-group> \
+  --enable-workload-identity \
+  --enable-oidc-issuer
+```
+
+Get the OIDC issuer URL:
+
+```bash
+az aks show \
+  --name <cluster-name> \
+  --resource-group <resource-group> \
+  --query "oidcIssuerProfile.issuerUrl" \
+  -o tsv
+```
+
+#### Step 2 — Create a Managed Identity
+
+```bash
+az identity create \
+  --name aks-health-mcp-identity \
+  --resource-group <resource-group>
+
+# Save these values
+CLIENT_ID=$(az identity show \
+  --name aks-health-mcp-identity \
+  --resource-group <resource-group> \
+  --query clientId -o tsv)
+
+OBJECT_ID=$(az identity show \
+  --name aks-health-mcp-identity \
+  --resource-group <resource-group> \
+  --query principalId -o tsv)
+```
+
+#### Step 3 — Assign Azure RBAC roles to the Managed Identity
+
+```bash
+SUBSCRIPTION_ID=<your-subscription-id>
+
+# Reader role for listing AKS clusters and resources
+az role assignment create \
+  --assignee $OBJECT_ID \
+  --role Reader \
+  --scope /subscriptions/$SUBSCRIPTION_ID
+
+# Monitoring Reader for Azure Monitor metrics
+az role assignment create \
+  --assignee $OBJECT_ID \
+  --role "Monitoring Reader" \
+  --scope /subscriptions/$SUBSCRIPTION_ID
+```
+
+#### Step 4 — Create a Federated Credential
+
+```bash
+OIDC_ISSUER=<issuer-url-from-step-1>
+NAMESPACE=aks-health
+
+az identity federated-credential create \
+  --name aks-health-federated \
+  --identity-name aks-health-mcp-identity \
+  --resource-group <resource-group> \
+  --issuer "$OIDC_ISSUER" \
+  --subject "system:serviceaccount:${NAMESPACE}:aks-health" \
+  --audience api://AzureADTokenExchange
+```
+
+> The `--subject` must match `system:serviceaccount:<namespace>:<serviceaccount-name>`. The default service account name is `aks-health` (the Helm release name). Adjust if you used a different release name.
+
+#### Step 5 — Configure Helm values
+
+Add these to your `my-values.yaml`:
+
+```yaml
+serviceAccount:
+  create: true
+  annotations:
+    azure.workload.identity/client-id: "<CLIENT_ID>"  # from Step 2
+
+podAnnotations:
+  azure.workload.identity/use: "true"
+
+# Leave credentials empty — Workload Identity handles auth
+backend:
+  credentials:
+    azureClientId: ""
+    azureClientSecret: ""
+    azureFoundryApiKey: ""
+```
+
+Upgrade the release to apply:
+
+```bash
+helm upgrade aks-health ./helm/aks-health \
+  --namespace aks-health \
+  --values my-values.yaml
+```
+
+---
+
+### Service Principal Authentication
+
+If Workload Identity is not available, use a Service Principal (created in [Step 4](#4-create-a-service-principal-optional--for-ci--robotic-access) of the Azure Setup):
+
+```yaml
+# my-values.yaml
+backend:
+  credentials:
+    azureClientId: "<AZURE_CLIENT_ID>"
+    azureClientSecret: "<AZURE_CLIENT_SECRET>"
+    # azureFoundryApiKey: "<key>"  # optional
+```
+
+The chart will create a Kubernetes Secret holding these values and mount it into the backend pod automatically. **Do not commit `my-values.yaml` containing real secrets.**
+
+Alternatively, if you manage secrets externally (Azure Key Vault CSI driver, External Secrets Operator, Sealed Secrets):
+
+```yaml
+backend:
+  existingSecret: "my-external-secret-name"
+  credentials: {}  # ignored when existingSecret is set
+```
+
+The external Secret must contain the keys: `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_FOUNDRY_API_KEY`.
+
+---
+
+### Helm Values Reference
+
+The full list of configurable values with their defaults:
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `backend.image.repository` | `""` | **Required.** Backend container image |
+| `backend.image.tag` | `"1.0.0"` | Image tag |
+| `backend.image.pullPolicy` | `IfNotPresent` | Image pull policy |
+| `backend.replicaCount` | `1` | Pod count (ignored when HPA enabled) |
+| `backend.resources.requests.cpu` | `250m` | CPU request |
+| `backend.resources.requests.memory` | `512Mi` | Memory request |
+| `backend.resources.limits.cpu` | `"1"` | CPU limit |
+| `backend.resources.limits.memory` | `1Gi` | Memory limit |
+| `backend.autoscaling.enabled` | `false` | Enable HPA |
+| `backend.autoscaling.minReplicas` | `1` | HPA min replicas |
+| `backend.autoscaling.maxReplicas` | `3` | HPA max replicas |
+| `backend.autoscaling.targetCPUUtilizationPercentage` | `70` | HPA CPU target |
+| `backend.config.azureTenantId` | `""` | **Required.** Azure AD tenant GUID |
+| `backend.config.azureSubscriptionIds` | `""` | **Required.** Comma-separated subscription GUIDs |
+| `backend.config.azureFoundryEndpoint` | `""` | **Required.** Azure AI Foundry endpoint URL |
+| `backend.config.azureFoundryModel` | `"gpt-4o"` | Foundry model deployment name |
+| `backend.config.azureAdAppClientId` | `""` | **Required.** App registration client ID |
+| `backend.config.azureAdAllowedGroup` | `""` | **Required.** AD security group Object ID |
+| `backend.config.frontendOrigin` | `""` | **Required.** Frontend URL (CORS allow-origin) |
+| `backend.config.logLevel` | `"INFO"` | Log level |
+| `backend.config.logFormat` | `"json"` | `json` or `console` |
+| `backend.credentials.azureClientId` | `""` | Service principal client ID |
+| `backend.credentials.azureClientSecret` | `""` | Service principal secret |
+| `backend.credentials.azureFoundryApiKey` | `""` | Azure AI Foundry API key |
+| `backend.existingSecret` | `""` | Name of pre-existing Kubernetes Secret |
+| `frontend.enabled` | `true` | Deploy the frontend |
+| `frontend.image.repository` | `""` | **Required.** Frontend container image |
+| `frontend.image.tag` | `"1.0.0"` | Image tag |
+| `frontend.replicaCount` | `1` | Pod count |
+| `ingress.enabled` | `false` | Create Ingress resource |
+| `ingress.className` | `"nginx"` | IngressClass name |
+| `ingress.annotations` | `{}` | Extra annotations (e.g. cert-manager) |
+| `ingress.host` | `""` | **Required when ingress enabled.** Hostname |
+| `ingress.tls.enabled` | `false` | Enable TLS on Ingress |
+| `ingress.tls.secretName` | `""` | TLS secret name (auto-generated if blank) |
+| `serviceAccount.create` | `true` | Create ServiceAccount |
+| `serviceAccount.annotations` | `{}` | Annotations (Workload Identity client-id) |
+| `rbac.create` | `true` | Create read-only ClusterRole + binding |
+| `imagePullSecrets` | `[]` | Image pull secrets list |
+| `podAnnotations` | `{}` | Annotations on all pods |
+| `podLabels` | `{}` | Extra labels on all pods |
+
+---
+
 ## Running Tests
 
 ```bash
@@ -647,6 +1023,40 @@ The request is missing an `Authorization: Bearer <token>` header. Every API call
 
 `FRONTEND_ORIGIN` in `.env` does not match the URL your browser is using. For local development it must be exactly `http://localhost:5173` (no trailing slash).
 
+### Helm: `backend.config.azureTenantId is required`
+
+You installed the chart without setting the required values. Make sure your `my-values.yaml` sets all fields marked **Required** in the [Helm Values Reference](#helm-values-reference), or pass them with `--set`:
+
+```bash
+helm install aks-health ./helm/aks-health \
+  --set backend.config.azureTenantId=00000000-... \
+  ...
+```
+
+### Helm: backend pod is `CrashLoopBackOff`
+
+Check the logs:
+
+```bash
+kubectl -n aks-health logs -l app.kubernetes.io/component=backend --previous
+```
+
+Common causes:
+- Missing or wrong Azure credentials (run `kubectl -n aks-health get secret` to confirm the secret exists).
+- Workload Identity annotation missing (`azure.workload.identity/use: "true"` on the pod).
+- Wrong `AZURE_FOUNDRY_ENDPOINT` — the URL must end with `/models`.
+
+### Helm: frontend shows blank page after Ingress is up
+
+The frontend `VITE_*` variables were not set at Docker build time. Rebuild the frontend image with the correct `--build-arg` values and push a new tag, then upgrade the Helm release.
+
+### Helm: `ImagePullBackOff`
+
+The cluster cannot pull the image. Check:
+1. ACR is attached to the cluster: `az aks show ... | grep acrProfile`
+2. Image tag matches what was pushed: `docker images | grep aks-health`
+3. If using a pull secret, it is listed under `imagePullSecrets` in `my-values.yaml`.
+
 ---
 
 ## Project Structure
@@ -709,8 +1119,31 @@ aks-health-mcp/
 │   ├── test_agents.py
 │   └── test_api_auth.py
 │
-├── pyproject.toml                 # deps: base + api + dev extras
+├── Dockerfile                         # Backend multi-stage Docker build
+├── .dockerignore
+├── deploy/
+│   └── nginx.conf                     # nginx config for frontend container
+├── frontend/
+│   └── Dockerfile                     # Frontend multi-stage Docker build (nginx-unprivileged)
+├── helm/
+│   └── aks-health/
+│       ├── Chart.yaml
+│       ├── values.yaml                # Full defaults + inline docs
+│       └── templates/
+│           ├── _helpers.tpl
+│           ├── NOTES.txt
+│           ├── serviceaccount.yaml
+│           ├── rbac.yaml              # Read-only ClusterRole + binding
+│           ├── configmap.yaml         # Non-sensitive config
+│           ├── secret.yaml            # Credentials (conditional)
+│           ├── backend-deployment.yaml
+│           ├── backend-service.yaml
+│           ├── backend-hpa.yaml       # HPA (conditional)
+│           ├── frontend-deployment.yaml
+│           ├── frontend-service.yaml
+│           └── ingress.yaml           # Ingress (conditional)
+├── pyproject.toml                     # deps: base + api + dev extras
 ├── Makefile
-├── .env.example                   # Copy to .env and fill in values
-└── frontend/.env.example          # Copy to frontend/.env and fill in values
+├── .env.example                       # Copy to .env and fill in values
+└── frontend/.env.example              # Copy to frontend/.env and fill in values
 ```

@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aks-health.fullname" . }}-backend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aks-health.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  {{- if not .Values.backend.autoscaling.enabled }}
+  replicas: {{ .Values.backend.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "aks-health.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        {{- include "aks-health.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: backend
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "aks-health.serviceAccountName" . }}
+
+      # All containers run as non-root user (uid 1000 matches the Dockerfile)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: backend
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          # Non-sensitive config comes from the ConfigMap
+          envFrom:
+            - configMapRef:
+                name: {{ include "aks-health.fullname" . }}
+
+          # Sensitive credentials come from a Secret (chart-managed or external)
+          {{- if include "aks-health.mountSecret" . }}
+            - secretRef:
+                name: {{ include "aks-health.secretName" . }}
+          {{- end }}
+
+          # Kubernetes liveness probe – restart the pod if /healthz fails
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+
+          # Readiness probe – remove the pod from Service endpoints until ready
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            # readOnlyRootFilesystem is false because Python/uvicorn writes
+            # bytecode cache and temp files.  Mount a tmpfs emptyDir if you
+            # need a strictly read-only root filesystem.
+            readOnlyRootFilesystem: false
+
+      # Graceful termination – give in-flight agent queries time to complete
+      terminationGracePeriodSeconds: 60

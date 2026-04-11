@@ -1,0 +1,42 @@
+{{- if .Values.rbac.create }}
+# Read-only ClusterRole for the Kubernetes API tools (k8s_* MCP tools).
+# Grants get/list/watch on the same resources as the manual RBAC in the README.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "aks-health.fullname" . }}-reader
+  labels:
+    {{- include "aks-health.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources:
+    - nodes
+    - pods
+    - events
+    - namespaces
+    - persistentvolumeclaims
+    - services
+    - componentstatuses
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources:
+    - deployments
+    - daemonsets
+    - statefulsets
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "aks-health.fullname" . }}-reader
+  labels:
+    {{- include "aks-health.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "aks-health.fullname" . }}-reader
+subjects:
+- kind: ServiceAccount
+  name: {{ include "aks-health.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,49 @@
+# Secrets — never include in image
+.env
+.env.*
+!.env.example
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test / dev tooling
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# Frontend (built separately)
+frontend/
+
+# Helm / deploy (not needed in app image)
+helm/
+deploy/
+
+# Docs
+*.md
+LICENSE
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+Dockerfile
+Dockerfile.*
+.dockerignore

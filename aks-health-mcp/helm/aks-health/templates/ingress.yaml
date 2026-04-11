@@ -1,0 +1,52 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "aks-health.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aks-health.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ required "ingress.host is required when ingress.enabled is true" .Values.ingress.host | quote }}
+      secretName: {{ include "aks-health.tlsSecretName" . }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.host is required when ingress.enabled is true" .Values.ingress.host | quote }}
+      http:
+        paths:
+          # All /api/* and /healthz requests route to the backend
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aks-health.fullname" . }}-backend
+                port:
+                  name: http
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "aks-health.fullname" . }}-backend
+                port:
+                  name: http
+          {{- if .Values.frontend.enabled }}
+          # Everything else goes to the React SPA frontend
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aks-health.fullname" . }}-frontend
+                port:
+                  name: http
+          {{- end }}
+{{- end }}
