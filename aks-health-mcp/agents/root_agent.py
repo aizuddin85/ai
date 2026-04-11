@@ -1,20 +1,19 @@
 """
-Root Orchestrator Agent
-=======================
-The root agent receives high-level health queries and decides how to
-delegate them to specialist task agents:
+Root Orchestrator Agent — powered by Azure AI Foundry.
+=====================================================
+The root agent receives high-level health queries and coordinates two
+specialist task agents through a Foundry ChatCompletionsClient tool-calling
+loop:
 
-  - AzureHealthAgent  – Azure Resource Manager perspective
-  - ClusterHealthAgent – Live Kubernetes API perspective
+  - AzureHealthAgent  – Azure Resource Manager perspective (aks_* tools)
+  - ClusterHealthAgent – Live Kubernetes API perspective (k8s_* tools)
 
 Architecture:
-  root agent (Claude)
-    ├── tool: query_azure_health   → AzureHealthAgent → MCP server (aks_* tools)
-    └── tool: query_cluster_health → ClusterHealthAgent → MCP server (k8s_* tools)
+  root agent (Azure AI Foundry model)
+    ├── tool: query_azure_health   → AzureHealthAgent → MCP server (aks_*)
+    └── tool: query_cluster_health → ClusterHealthAgent → MCP server (k8s_*)
 
-The root agent synthesises the responses from both sub-agents into a
-coherent overall health summary with actionable findings and remediation
-suggestions.
+Sub-agent calls run concurrently (asyncio.gather) to minimise latency.
 
 Usage:
     import asyncio
@@ -36,11 +35,22 @@ import asyncio
 import json
 from typing import Any
 
-import anthropic
 import structlog
+from azure.ai.inference import ChatCompletionsClient
+from azure.ai.inference.models import (
+    AssistantMessage,
+    ChatCompletionsToolDefinition,
+    CompletionsFinishReason,
+    FunctionDefinition,
+    SystemMessage,
+    ToolMessage,
+    UserMessage,
+)
+from azure.core.credentials import AzureKeyCredential
 
 from agents.task_agents.azure_health_agent import AzureHealthAgent
 from agents.task_agents.cluster_health_agent import ClusterHealthAgent
+from server.auth.credentials import get_azure_credential
 from server.config import get_settings
 from server.logging_config import configure_logging, get_logger
 
@@ -70,173 +80,195 @@ Your workflow:
 
 Guidelines:
   - Always invoke BOTH agents when the user asks for overall health.
-  - Invoke only the relevant agent for narrow questions
-    (e.g. "are my pods healthy?" → cluster_health_agent only).
-  - Never fabricate data; base your report entirely on the sub-agents'
-    responses.
-  - When sub-agents return errors, include them in the report with
-    suggested investigation steps.
+  - Invoke only the relevant agent for narrow questions.
+  - Never fabricate data; base your report entirely on sub-agent responses.
+  - When sub-agents return errors, include them with suggested next steps.
   - Format the final report as structured Markdown:
       ## Executive Summary
       ## Critical Issues  (if any)
       ## Warnings         (if any)
       ## Informational
       ## Recommended Actions
-
-Output: a single, comprehensive Markdown health report.
 """
 
-# Tool definitions passed to the root Claude agent
-_ROOT_TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "query_azure_health",
-        "description": (
-            "Delegate a query to the Azure AKS Health Agent, which uses the "
-            "Azure Resource Manager API to check cluster provisioning state, "
-            "node pool status, resource health events, upgrade profiles, and "
-            "Azure Monitor metrics. Use this for Azure control-plane questions."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "The specific health question to ask the Azure agent, e.g.: "
-                        "'List all clusters and their provisioning states' or "
-                        "'Are there any active resource health events?'"
-                    ),
-                }
+# Tool definitions given to the root Foundry model
+_ROOT_TOOLS: list[ChatCompletionsToolDefinition] = [
+    ChatCompletionsToolDefinition(
+        function=FunctionDefinition(
+            name="query_azure_health",
+            description=(
+                "Delegate a query to the Azure AKS Health Agent, which uses the "
+                "Azure Resource Manager API to check cluster provisioning state, "
+                "node pool status, resource health events, upgrade profiles, and "
+                "Azure Monitor metrics. Use this for Azure control-plane questions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The specific health question to ask the Azure agent, e.g.: "
+                            "'List all clusters and their provisioning states' or "
+                            "'Are there any active resource health events?'"
+                        ),
+                    }
+                },
+                "required": ["query"],
             },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "query_cluster_health",
-        "description": (
-            "Delegate a query to the Cluster Health Agent, which uses the "
-            "live Kubernetes API to check node readiness, pod health, "
-            "deployment/DaemonSet/StatefulSet status, events, PVCs, and "
-            "control-plane component health. Use this for workload-level questions."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "The specific health question to ask the Kubernetes agent, e.g.: "
-                        "'List all pods not in Running state' or "
-                        "'Are there any Warning events in the last hour?'"
-                    ),
-                }
+        )
+    ),
+    ChatCompletionsToolDefinition(
+        function=FunctionDefinition(
+            name="query_cluster_health",
+            description=(
+                "Delegate a query to the Cluster Health Agent, which uses the "
+                "live Kubernetes API to check node readiness, pod health, "
+                "deployment/DaemonSet/StatefulSet status, events, PVCs, and "
+                "control-plane component health. Use this for workload-level questions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The specific health question to ask the Kubernetes agent, e.g.: "
+                            "'List all pods not in Running state' or "
+                            "'Are there any Warning events in the last hour?'"
+                        ),
+                    }
+                },
+                "required": ["query"],
             },
-            "required": ["query"],
-        },
-    },
+        )
+    ),
 ]
 
 
 class RootAgent:
     """
-    Root orchestrator agent.
+    Root orchestrator agent powered by Azure AI Foundry.
 
     Coordinates AzureHealthAgent and ClusterHealthAgent to answer
-    comprehensive AKS health questions.
+    comprehensive AKS health questions using the Foundry ChatCompletionsClient.
     """
 
     def __init__(self) -> None:
         settings = get_settings()
-        self._client = anthropic.Anthropic(
-            api_key=settings.anthropic_api_key.get_secret_value()
-        )
-        self._model = settings.claude_model
+        self._model = settings.azure_foundry_model
+        self._foundry_client = self._build_client(settings)
         self._azure_agent = AzureHealthAgent()
         self._cluster_agent = ClusterHealthAgent()
         self._log = get_logger("agent.root")
 
+    @staticmethod
+    def _build_client(settings: Any) -> ChatCompletionsClient:
+        endpoint = settings.azure_foundry_endpoint
+        if settings.uses_foundry_key_auth:
+            logger.info("root_agent.foundry.auth", mode="api_key")
+            credential: Any = AzureKeyCredential(
+                settings.azure_foundry_api_key.get_secret_value()
+            )
+        else:
+            logger.info(
+                "root_agent.foundry.auth",
+                mode="azure_ad",
+                uses_sp=settings.uses_service_principal,
+            )
+            credential = get_azure_credential()
+        return ChatCompletionsClient(endpoint=endpoint, credential=credential)
+
     async def run(self, query: str) -> str:
         """
-        Process a high-level AKS health query and return a synthesised report.
+        Process a high-level AKS health query and return a synthesised
+        Markdown report.
 
         Args:
-            query: Natural-language health question, e.g.
-                   "What is the overall health of my AKS environment?"
+            query: Natural-language health question.
 
         Returns:
             Formatted Markdown health report.
         """
         self._log.info("root_agent.run.start", query=query[:200])
-        messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
+        messages: list[Any] = [
+            SystemMessage(content=_SYSTEM_PROMPT),
+            UserMessage(content=query),
+        ]
         max_iterations = 6
 
         for iteration in range(max_iterations):
             self._log.debug("root_agent.loop.iteration", i=iteration)
 
-            response = self._client.messages.create(
+            response = self._foundry_client.complete(
                 model=self._model,
+                messages=messages,
+                tools=_ROOT_TOOLS,
                 max_tokens=8192,
-                system=_SYSTEM_PROMPT,
-                tools=_ROOT_TOOLS,  # type: ignore[arg-type]
-                messages=messages,  # type: ignore[arg-type]
+                temperature=0.0,
             )
 
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            text_blocks = [b for b in response.content if b.type == "text"]
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            message = choice.message
 
-            if response.stop_reason == "end_turn" or not tool_uses:
-                final_answer = " ".join(b.text for b in text_blocks).strip()
+            if (
+                finish_reason == CompletionsFinishReason.STOPPED
+                or not getattr(message, "tool_calls", None)
+            ):
+                final_answer = message.content or ""
                 self._log.info("root_agent.run.done", answer_length=len(final_answer))
                 return final_answer
 
-            # Append assistant turn
+            # Append assistant turn with tool call info
             messages.append(
-                {
-                    "role": "assistant",
-                    "content": [b.model_dump() for b in response.content],
-                }
+                AssistantMessage(
+                    content=message.content,
+                    tool_calls=message.tool_calls,
+                )
             )
 
-            # Dispatch sub-agent calls concurrently for efficiency
-            tool_results = await self._dispatch_tools(tool_uses)
-
-            messages.append({"role": "user", "content": tool_results})
+            # Run all sub-agent calls concurrently
+            tool_results = await self._dispatch_tools(message.tool_calls)
+            messages.extend(tool_results)
 
         self._log.warning("root_agent.max_iterations_reached", max=max_iterations)
         return "Maximum orchestration iterations reached. Please narrow your query."
 
     async def _dispatch_tools(
-        self, tool_uses: list[Any]
-    ) -> list[dict[str, Any]]:
+        self, tool_calls: list[Any]
+    ) -> list[ToolMessage]:
         """
-        Run all tool calls concurrently and collect results.
-        Parallel execution reduces overall latency when both agents are needed.
+        Execute all tool calls concurrently and return ToolMessage objects.
+        Parallel execution minimises wall-clock time when both agents are needed.
         """
-        tasks = [self._call_sub_agent(tu.id, tu.name, tu.input) for tu in tool_uses]
+        tasks = [
+            self._call_sub_agent(tc.id, tc.function.name, tc.function.arguments)
+            for tc in tool_calls
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        tool_results: list[dict[str, Any]] = []
-        for i, result in enumerate(results):
-            tool_use_id = tool_uses[i].id
+        tool_messages: list[ToolMessage] = []
+        for tc, result in zip(tool_calls, results):
             if isinstance(result, Exception):
                 content = json.dumps({"error": str(result)})
             else:
                 content = str(result)
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": content,
-                }
+            tool_messages.append(
+                ToolMessage(tool_call_id=tc.id, content=content)
             )
-
-        return tool_results
+        return tool_messages
 
     async def _call_sub_agent(
-        self, tool_use_id: str, tool_name: str, tool_input: dict[str, Any]
+        self, tool_use_id: str, tool_name: str, arguments_str: str
     ) -> str:
         """Route a tool call to the appropriate sub-agent."""
-        sub_query: str = tool_input.get("query", "")
+        try:
+            args = json.loads(arguments_str) if arguments_str else {}
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+
+        sub_query: str = args.get("query", "")
         self._log.info("root_agent.sub_agent.call", tool=tool_name, query=sub_query[:100])
 
         if tool_name == "query_azure_health":
@@ -244,7 +276,7 @@ class RootAgent:
         elif tool_name == "query_cluster_health":
             return await self._cluster_agent.run(sub_query)
         else:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+            return json.dumps({"error": f"Unknown sub-agent tool: {tool_name}"})
 
 
 # ---------------------------------------------------------------------------

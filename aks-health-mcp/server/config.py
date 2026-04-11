@@ -52,10 +52,23 @@ class Settings(BaseSettings):
     api_timeout_seconds: int = Field(default=30, description="Azure/K8s API call timeout")
 
     # ------------------------------------------------------------------
-    # Anthropic (agents)
+    # Azure AI Foundry (agents)
+    # The endpoint is the Azure AI Foundry project inference URL, e.g.:
+    #   https://<project>.services.ai.azure.com/models
+    # Auth reuses the same Azure credential chain (SP or user).
+    # Set foundry_api_key ONLY when using key-based auth instead of Azure AD.
     # ------------------------------------------------------------------
-    anthropic_api_key: SecretStr = Field(..., description="Anthropic API key (masked in logs)")
-    claude_model: str = Field(default="claude-sonnet-4-6", description="Claude model for agents")
+    azure_foundry_endpoint: str = Field(
+        ..., description="Azure AI Foundry inference endpoint URL"
+    )
+    azure_foundry_model: str = Field(
+        default="gpt-4o",
+        description="Model deployment name in Azure AI Foundry",
+    )
+    azure_foundry_api_key: SecretStr | None = Field(
+        default=None,
+        description="Foundry API key (masked in logs). Leave blank to use Azure AD credential.",
+    )
 
     # ------------------------------------------------------------------
     # Logging
@@ -82,6 +95,11 @@ class Settings(BaseSettings):
     def uses_service_principal(self) -> bool:
         """True when SP credentials are fully configured."""
         return bool(self.azure_client_id and self.azure_client_secret)
+
+    @property
+    def uses_foundry_key_auth(self) -> bool:
+        """True when key-based auth is configured for Azure AI Foundry."""
+        return self.azure_foundry_api_key is not None
 
 
 @lru_cache(maxsize=1)

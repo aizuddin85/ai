@@ -5,7 +5,10 @@ install:
 	pip install -e .
 
 dev-install:
-	pip install -e ".[dev]"
+	pip install -e ".[dev,api]"
+
+api-install:
+	pip install -e ".[api]"
 
 # ── Quality gates ─────────────────────────────────────────────────────────────
 test:
@@ -28,6 +31,14 @@ run-stdio:
 
 run-sse:
 	MCP_TRANSPORT=sse python -m server.main
+
+# ── Run FastAPI backend ───────────────────────────────────────────────────────
+run-api:
+	uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+# ── Run frontend dev server ───────────────────────────────────────────────────
+run-frontend:
+	cd frontend && npm run dev
 
 # ── Run root agent ────────────────────────────────────────────────────────────
 run-agent:

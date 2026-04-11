@@ -4,8 +4,6 @@ Sets mandatory env vars so Settings validation passes without real credentials.
 """
 from __future__ import annotations
 
-import os
-
 import pytest
 
 
@@ -14,13 +12,15 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Inject stub environment variables before every test."""
     monkeypatch.setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
     monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", "11111111-1111-1111-1111-111111111111")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+    monkeypatch.setenv("AZURE_FOUNDRY_ENDPOINT", "https://test-project.services.ai.azure.com/models")
+    monkeypatch.setenv("AZURE_FOUNDRY_MODEL", "gpt-4o")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("LOG_FORMAT", "console")
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
     # Clear any real SP credentials so tests always use mock paths
     monkeypatch.delenv("AZURE_CLIENT_ID", raising=False)
     monkeypatch.delenv("AZURE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("AZURE_FOUNDRY_API_KEY", raising=False)
 
 
 @pytest.fixture(autouse=True)

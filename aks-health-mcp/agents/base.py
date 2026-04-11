@@ -1,16 +1,23 @@
 """
-Base agent class.
+Base agent class — powered by Azure AI Foundry.
 
 Each agent:
   1. Launches the MCP server as a child process (stdio transport).
   2. Connects to it via the MCP client SDK.
-  3. Discovers available tools and converts them to Anthropic tool format.
-  4. Runs a multi-turn Claude conversation, auto-dispatching tool calls
-     back through the MCP client until the model returns a final answer.
+  3. Discovers available tools and converts them to the Azure AI Foundry
+     ChatCompletionsToolDefinition format.
+  4. Runs a multi-turn conversation loop via ChatCompletionsClient,
+     auto-dispatching tool calls back through the MCP client until the
+     model returns finish_reason == "stop".
   5. Tears down the MCP connection and server process cleanly on exit.
 
-The base class is intentionally tool-agnostic; subclasses limit the
-tool set they expose to Claude so each agent stays focused.
+Authentication for the Foundry client follows the same pattern as the
+MCP server's Azure credential chain:
+  - If AZURE_FOUNDRY_API_KEY is set → AzureKeyCredential (key auth)
+  - Otherwise → the Azure AD ChainedTokenCredential (SP or user login)
+
+The base class is tool-agnostic; subclasses narrow the visible tool set
+via tool_prefix so each agent stays focused on its domain.
 """
 from __future__ import annotations
 
@@ -18,50 +25,56 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
-import anthropic
 import structlog
+from azure.ai.inference import ChatCompletionsClient
+from azure.ai.inference.models import (
+    AssistantMessage,
+    ChatCompletionsToolCall,
+    ChatCompletionsToolDefinition,
+    CompletionsFinishReason,
+    FunctionDefinition,
+    SystemMessage,
+    ToolMessage,
+    UserMessage,
+)
+from azure.core.credentials import AzureKeyCredential
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import Tool as McpTool
 
+from server.auth.credentials import get_azure_credential
 from server.config import get_settings
 from server.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Server launch command (resolve to absolute path for safety)
-_SERVER_CMD = [
-    sys.executable,
-    "-m",
-    "server.main",
-]
+# Server launch command (always stdio when spawned by an agent)
+_SERVER_CMD = [sys.executable, "-m", "server.main"]
 _REPO_ROOT = Path(__file__).parent.parent
 
 
 class BaseMcpAgent:
     """
-    Base class for agents that call the AKS Health MCP server.
+    Base class for agents that call the AKS Health MCP server using
+    Azure AI Foundry as the LLM provider.
 
     Subclasses should set:
-      - name        : human-readable agent name (for logging)
-      - system_prompt: Claude system prompt scoping the agent's role
-      - tool_prefix  : if non-empty, only MCP tools whose names start
-                       with this prefix are made available to Claude.
-                       E.g. "aks_" for Azure-only, "k8s_" for cluster-only.
-                       Leave empty ("") to expose all tools.
+      name        : human-readable agent name (used in logging).
+      system_prompt: Foundry system message scoping the agent's role.
+      tool_prefix  : Only MCP tools whose names start with this prefix are
+                     exposed to the model. Empty string → all tools.
+                     E.g. "aks_" for Azure-only, "k8s_" for cluster-only.
     """
 
     name: str = "base"
     system_prompt: str = "You are a helpful AKS health assistant."
-    tool_prefix: str = ""  # empty → all tools
+    tool_prefix: str = ""
 
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._client = anthropic.Anthropic(
-            api_key=self._settings.anthropic_api_key.get_secret_value()
-        )
+        self._foundry_client = self._build_foundry_client()
         self._log = get_logger(f"agent.{self.name}")
 
     # ------------------------------------------------------------------
@@ -88,8 +101,8 @@ class BaseMcpAgent:
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                claude_tools = await self._discover_tools(session)
-                answer = await self._conversation_loop(session, query, claude_tools)
+                foundry_tools = await self._discover_tools(session)
+                answer = await self._conversation_loop(session, query, foundry_tools)
 
         self._log.info("agent.run.done", answer_length=len(answer))
         return answer
@@ -98,108 +111,139 @@ class BaseMcpAgent:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _build_foundry_client(self) -> ChatCompletionsClient:
+        """Build the Azure AI Foundry ChatCompletionsClient."""
+        settings = self._settings
+        endpoint = settings.azure_foundry_endpoint
+
+        if settings.uses_foundry_key_auth:
+            logger.info("foundry.auth.mode", mode="api_key")
+            credential: Any = AzureKeyCredential(
+                settings.azure_foundry_api_key.get_secret_value()  # type: ignore[union-attr]
+            )
+        else:
+            logger.info(
+                "foundry.auth.mode",
+                mode="azure_ad",
+                uses_sp=settings.uses_service_principal,
+            )
+            credential = get_azure_credential()
+
+        return ChatCompletionsClient(endpoint=endpoint, credential=credential)
+
     def _build_server_env(self) -> dict[str, str]:
         """
         Build the environment for the MCP server child process.
-        Passes all required env vars; never logs secrets.
+        Always sets stdio transport; injects PYTHONPATH for imports.
         """
         env = dict(os.environ)
-        # Always use stdio when launched as a subprocess by an agent
         env["MCP_TRANSPORT"] = "stdio"
-        # Ensure pythonpath includes the project root
         env["PYTHONPATH"] = str(_REPO_ROOT)
         return env
 
-    async def _discover_tools(self, session: ClientSession) -> list[dict[str, Any]]:
+    async def _discover_tools(
+        self, session: ClientSession
+    ) -> list[ChatCompletionsToolDefinition]:
         """
-        Fetch tools from the MCP server and convert to Anthropic format.
+        Fetch tools from the MCP server and convert them to the
+        Azure AI Foundry ChatCompletionsToolDefinition format.
         Applies self.tool_prefix filter.
         """
-        mcp_tools_response = await session.list_tools()
-        mcp_tools: list[McpTool] = mcp_tools_response.tools
+        mcp_response = await session.list_tools()
+        mcp_tools: list[McpTool] = mcp_response.tools
 
-        claude_tools: list[dict[str, Any]] = []
+        foundry_tools: list[ChatCompletionsToolDefinition] = []
         for tool in mcp_tools:
             if self.tool_prefix and not tool.name.startswith(self.tool_prefix):
                 continue
-            claude_tools.append(
-                {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema,
-                }
+            foundry_tools.append(
+                ChatCompletionsToolDefinition(
+                    function=FunctionDefinition(
+                        name=tool.name,
+                        description=tool.description or "",
+                        parameters=tool.inputSchema,
+                    )
+                )
             )
 
         self._log.info(
             "agent.tools.discovered",
             total_mcp=len(mcp_tools),
-            filtered=len(claude_tools),
+            filtered=len(foundry_tools),
             prefix=self.tool_prefix or "(all)",
         )
-        return claude_tools
+        return foundry_tools
 
     async def _conversation_loop(
         self,
         session: ClientSession,
         query: str,
-        tools: list[dict[str, Any]],
+        tools: list[ChatCompletionsToolDefinition],
     ) -> str:
         """
-        Run the agentic loop:
-          1. Send messages to Claude with available tools.
-          2. Execute any tool_use blocks via the MCP client.
-          3. Feed results back to Claude.
-          4. Repeat until Claude returns stop_reason == "end_turn".
+        Agentic loop using Azure AI Foundry ChatCompletionsClient:
+          1. Send messages + tools to the model.
+          2. If finish_reason == "tool_calls", execute each tool via MCP.
+          3. Append tool results and loop.
+          4. Return the final text when finish_reason == "stop".
         """
-        messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
-        max_iterations = 10  # guard against infinite loops
+        settings = self._settings
+        messages: list[Any] = [
+            SystemMessage(content=self.system_prompt),
+            UserMessage(content=query),
+        ]
+        max_iterations = 10
 
         for iteration in range(max_iterations):
             self._log.debug("agent.loop.iteration", i=iteration, messages=len(messages))
 
-            response = self._client.messages.create(
-                model=self._settings.claude_model,
+            response = self._foundry_client.complete(
+                model=settings.azure_foundry_model,
+                messages=messages,
+                tools=tools if tools else None,
                 max_tokens=4096,
-                system=self.system_prompt,
-                tools=tools,  # type: ignore[arg-type]
-                messages=messages,  # type: ignore[arg-type]
+                temperature=0.0,  # deterministic for health reporting
             )
 
-            # Collect all content blocks from the response
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            text_blocks = [b for b in response.content if b.type == "text"]
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            message = choice.message
 
-            if response.stop_reason == "end_turn" or not tool_uses:
-                # Return the final text answer
-                return " ".join(b.text for b in text_blocks).strip()
+            if (
+                finish_reason == CompletionsFinishReason.STOPPED
+                or not getattr(message, "tool_calls", None)
+            ):
+                return message.content or ""
 
-            # Append assistant turn (with all content blocks)
+            # Append assistant message with tool calls
             messages.append(
-                {
-                    "role": "assistant",
-                    "content": [b.model_dump() for b in response.content],
-                }
+                AssistantMessage(
+                    content=message.content,
+                    tool_calls=message.tool_calls,
+                )
             )
 
-            # Execute tool calls and collect results
-            tool_results: list[dict[str, Any]] = []
-            for tool_use in tool_uses:
-                result_content = await self._execute_tool(session, tool_use.name, tool_use.input)
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": result_content,
-                    }
-                )
+            # Execute each tool call and collect results
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                try:
+                    tool_args = json.loads(tool_call.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    tool_args = {}
+
+                result_content = await self._execute_tool(session, tool_name, tool_args)
                 self._log.info(
                     "agent.tool.executed",
-                    tool=tool_use.name,
+                    tool=tool_name,
+                    call_id=tool_call.id,
                     result_length=len(result_content),
                 )
-
-            # Append user turn with all tool results
-            messages.append({"role": "user", "content": tool_results})
+                messages.append(
+                    ToolMessage(
+                        tool_call_id=tool_call.id,
+                        content=result_content,
+                    )
+                )
 
         self._log.warning("agent.loop.max_iterations_reached", max=max_iterations)
         return "Maximum iterations reached. Partial results may be incomplete."
@@ -211,7 +255,6 @@ class BaseMcpAgent:
         self._log.info("agent.tool.call", tool=tool_name)
         try:
             result = await session.call_tool(tool_name, arguments=tool_input)
-            # MCP result content is a list of content objects
             parts: list[str] = []
             for item in result.content:
                 if hasattr(item, "text"):
