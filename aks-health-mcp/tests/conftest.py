@@ -11,7 +11,9 @@ import pytest
 def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Inject stub environment variables before every test."""
     monkeypatch.setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000")
-    monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("AZURE_SUBSCRIPTION_IDS", "11111111-1111-1111-1111-111111111111")
+    # Remove the old singular env var so it does not shadow the list field
+    monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
     monkeypatch.setenv("AZURE_FOUNDRY_ENDPOINT", "https://test-project.services.ai.azure.com/models")
     monkeypatch.setenv("AZURE_FOUNDRY_MODEL", "gpt-4o")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")

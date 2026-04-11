@@ -328,8 +328,11 @@ Open `.env` in a text editor. Below is a description of every field:
 # Your Azure AD Tenant ID (GUID from Step 1)
 AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000
 
-# Your Azure Subscription ID (GUID from Step 1)
-AZURE_SUBSCRIPTION_ID=11111111-1111-1111-1111-111111111111
+# One or more Azure subscription IDs to query (comma-separated).
+# Single subscription:
+AZURE_SUBSCRIPTION_IDS=11111111-1111-1111-1111-111111111111
+# Multiple subscriptions (aks_list_clusters and health events iterate all of them):
+# AZURE_SUBSCRIPTION_IDS=11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222
 
 # Service principal credentials (from Step 4).
 # Leave blank if using `az login` for local development.

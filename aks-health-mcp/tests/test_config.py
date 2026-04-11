@@ -76,3 +76,49 @@ def test_default_foundry_model() -> None:
 def test_custom_foundry_model() -> None:
     s = Settings(**_BASE, azure_foundry_model="gpt-4o-mini")  # type: ignore[arg-type]
     assert s.azure_foundry_model == "gpt-4o-mini"
+
+
+# ---------------------------------------------------------------------------
+# azure_subscription_ids
+# ---------------------------------------------------------------------------
+
+
+def test_subscription_ids_single_value() -> None:
+    """A single subscription ID is parsed into a one-element list via the property."""
+    s = Settings(**_BASE, azure_subscription_ids="11111111-1111-1111-1111-111111111111")  # type: ignore[arg-type]
+    assert s.subscription_ids == ["11111111-1111-1111-1111-111111111111"]
+    assert s.azure_subscription_id == "11111111-1111-1111-1111-111111111111"
+
+
+def test_subscription_ids_comma_separated() -> None:
+    """Comma-separated string is parsed into a list."""
+    val = "11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222"
+    s = Settings(**_BASE, azure_subscription_ids=val)  # type: ignore[arg-type]
+    assert len(s.subscription_ids) == 2
+    assert "11111111-1111-1111-1111-111111111111" in s.subscription_ids
+    assert "22222222-2222-2222-2222-222222222222" in s.subscription_ids
+
+
+def test_subscription_ids_comma_separated_with_spaces() -> None:
+    """Whitespace around commas is stripped."""
+    val = "11111111-1111-1111-1111-111111111111 , 22222222-2222-2222-2222-222222222222"
+    s = Settings(**_BASE, azure_subscription_ids=val)  # type: ignore[arg-type]
+    assert s.subscription_ids == [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+    ]
+
+
+def test_subscription_ids_empty_defaults_to_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When AZURE_SUBSCRIPTION_IDS is absent, the list is empty."""
+    monkeypatch.delenv("AZURE_SUBSCRIPTION_IDS", raising=False)
+    s = Settings(**_BASE)  # type: ignore[arg-type]
+    assert s.subscription_ids == []
+    assert s.azure_subscription_id is None
+
+
+def test_subscription_id_property_returns_first() -> None:
+    """azure_subscription_id backward-compat property returns first element."""
+    val = "11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222"
+    s = Settings(**_BASE, azure_subscription_ids=val)  # type: ignore[arg-type]
+    assert s.azure_subscription_id == "11111111-1111-1111-1111-111111111111"

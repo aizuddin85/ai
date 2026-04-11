@@ -91,10 +91,12 @@ def aks_list_clusters(
     resource_group: str = "",
 ) -> str:
     """
-    List AKS clusters in an Azure subscription.
+    List AKS clusters across one or more Azure subscriptions.
 
-    Use resource_group to scope the listing to a specific resource group.
-    Leave subscription_id blank to use the server's default subscription.
+    Leave subscription_id blank to query ALL subscriptions configured in
+    AZURE_SUBSCRIPTION_IDS (aggregated results with per-cluster subscription_id).
+    Provide subscription_id to scope the query to a single subscription.
+    Use resource_group to further narrow results to a specific resource group.
     """
     _audit("aks_list_clusters", {"subscription_id": subscription_id, "resource_group": resource_group})
     return list_aks_clusters(
@@ -175,9 +177,11 @@ def aks_get_resource_health_events(
     cluster_name: str = "",
 ) -> str:
     """
-    Retrieve Azure Resource Health events affecting AKS resources.
+    Retrieve Azure Resource Health events across one or more subscriptions.
 
-    Scope the query by providing resource_group and/or cluster_name.
+    Leave subscription_id blank to query ALL subscriptions configured in
+    AZURE_SUBSCRIPTION_IDS.  Scope by resource_group and/or cluster_name
+    to filter results to a specific cluster.
     Returns service health incidents, planned maintenance, and security advisories.
     """
     _audit(

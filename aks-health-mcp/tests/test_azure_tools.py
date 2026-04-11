@@ -113,9 +113,86 @@ def test_list_aks_clusters_with_resource_group(
     mock_instance.managed_clusters.list_by_resource_group.assert_called_once_with("my-rg")
 
 
-def test_list_aks_clusters_no_subscription() -> None:
-    result = json.loads(list_aks_clusters(subscription_id=""))
+def test_list_aks_clusters_no_subscription(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When no subscription is configured and none is passed, return an error."""
+    from server.config import get_settings
+    monkeypatch.delenv("AZURE_SUBSCRIPTION_IDS", raising=False)
+    get_settings.cache_clear()
+    result = json.loads(list_aks_clusters())
     assert "error" in result
+    get_settings.cache_clear()
+
+
+@patch("server.tools.azure_aks.ContainerServiceClient")
+@patch("server.tools.azure_aks.get_azure_credential")
+def test_list_aks_clusters_multi_subscription(
+    mock_cred: MagicMock, mock_cs: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clusters from both subscriptions are aggregated into one response."""
+    from server.config import get_settings
+    monkeypatch.setenv(
+        "AZURE_SUBSCRIPTION_IDS",
+        "11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222",
+    )
+    get_settings.cache_clear()
+
+    mock_cred.return_value = MagicMock()
+    # Each ContainerServiceClient instance returns different clusters
+    mock_instance = mock_cs.return_value
+    mock_instance.managed_clusters.list.side_effect = [
+        [_mock_cluster("cluster-sub1", sub="11111111-1111-1111-1111-111111111111")],
+        [_mock_cluster("cluster-sub2", sub="22222222-2222-2222-2222-222222222222")],
+    ]
+
+    result = json.loads(list_aks_clusters())
+
+    assert result["count"] == 2
+    assert result["subscriptions_queried"] == [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+    ]
+    names = [c["name"] for c in result["clusters"]]
+    assert "cluster-sub1" in names
+    assert "cluster-sub2" in names
+    # Each cluster record now includes its subscription_id
+    subs_in_response = {c["subscription_id"] for c in result["clusters"]}
+    assert "11111111-1111-1111-1111-111111111111" in subs_in_response
+    assert "22222222-2222-2222-2222-222222222222" in subs_in_response
+
+    get_settings.cache_clear()
+
+
+@patch("server.tools.azure_aks._list_clusters_raw")
+@patch("server.tools.azure_aks.get_azure_credential")
+def test_list_aks_clusters_multi_sub_partial_error(
+    mock_cred: MagicMock, mock_raw: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing subscription contributes an error entry but doesn't abort the query.
+
+    _list_clusters_raw is patched directly to bypass tenacity retry logic.
+    """
+    from azure.core.exceptions import HttpResponseError
+    from server.config import get_settings
+    monkeypatch.setenv(
+        "AZURE_SUBSCRIPTION_IDS",
+        "11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222",
+    )
+    get_settings.cache_clear()
+
+    mock_cred.return_value = MagicMock()
+    # First subscription succeeds; second raises HttpResponseError (already reraise=True)
+    mock_raw.side_effect = [
+        [_mock_cluster("cluster-sub1")],
+        HttpResponseError(message="AuthorizationFailed"),
+    ]
+
+    result = json.loads(list_aks_clusters())
+
+    assert result["count"] == 1
+    assert "errors" in result
+    assert result["errors"][0]["subscription_id"] == "22222222-2222-2222-2222-222222222222"
+
+    get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
