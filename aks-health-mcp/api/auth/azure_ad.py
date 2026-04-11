@@ -220,7 +220,11 @@ async def _graph_check(
             detail="Unable to verify group membership via Microsoft Graph",
         ) from exc
 
-    group_ids = {g["id"] for g in data.get("value", [])}
+    group_ids = {
+        g["id"]
+        for g in data.get("value", [])
+        if isinstance(g, dict) and "id" in g
+    }
     if required_group in group_ids:
         logger.info(
             "auth.group.authorized_via_graph",

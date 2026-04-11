@@ -81,10 +81,10 @@ async def _run_agent_stream(
     })
 
     async with _AGENT_SEMAPHORE:
+        # Create the heartbeat task before the try block so it is always
+        # reachable in the finally clause and can be properly cancelled.
+        heartbeat_task = asyncio.create_task(_heartbeat(query_id))
         try:
-            # Send a heartbeat every 5 s so the browser connection stays alive
-            heartbeat_task = asyncio.create_task(_heartbeat(query_id))
-
             yield _sse({
                 "type": "status",
                 "query_id": query_id,
@@ -93,8 +93,6 @@ async def _run_agent_stream(
 
             agent = RootAgent()
             result = await agent.run(query)
-
-            heartbeat_task.cancel()
 
             log.info("agent.query.done", result_length=len(result))
             yield _sse({"type": "result", "query_id": query_id, "content": result})
@@ -114,6 +112,8 @@ async def _run_agent_stream(
                 "message": f"Agent error: {exc}",
             })
         finally:
+            # Always cancel the heartbeat and emit the terminal event.
+            heartbeat_task.cancel()
             yield _sse({"type": "done", "query_id": query_id})
 
 
