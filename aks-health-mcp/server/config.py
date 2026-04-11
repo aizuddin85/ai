@@ -25,9 +25,19 @@ class Settings(BaseSettings):
     # Azure authentication
     # ------------------------------------------------------------------
     azure_tenant_id: str = Field(..., description="Azure AD tenant ID")
-    azure_subscription_id: str | None = Field(
-        default=None, description="Default Azure subscription ID"
+
+    # Stored as a raw comma-separated string so pydantic-settings reads it
+    # as a plain string (not JSON).  Use the `subscription_ids` property to
+    # get the parsed list.
+    # Example: "sub1-guid,sub2-guid,sub3-guid"
+    azure_subscription_ids: str | None = Field(
+        default=None,
+        description=(
+            "Comma-separated Azure subscription IDs to query, e.g. "
+            "'11111111-...,22222222-...'.  A single ID is also accepted."
+        ),
     )
+
     # SP credentials – optional; absence triggers user/CLI auth
     azure_client_id: str | None = Field(default=None, description="Service principal app ID")
     azure_client_secret: SecretStr | None = Field(
@@ -77,7 +87,7 @@ class Settings(BaseSettings):
     log_format: Literal["json", "console"] = Field(default="json")
 
     # ------------------------------------------------------------------
-    # Derived helpers
+    # Validators
     # ------------------------------------------------------------------
     @field_validator("azure_tenant_id")
     @classmethod
@@ -90,6 +100,30 @@ class Settings(BaseSettings):
         ):
             raise ValueError("azure_tenant_id must be a valid GUID")
         return v
+
+    # ------------------------------------------------------------------
+    # Derived helpers
+    # ------------------------------------------------------------------
+    @property
+    def subscription_ids(self) -> list[str]:
+        """Return the configured subscription IDs as a list.
+
+        Parses the comma-separated AZURE_SUBSCRIPTION_IDS value.
+        Returns an empty list when the env var is not set.
+        """
+        if not self.azure_subscription_ids:
+            return []
+        return [s.strip() for s in self.azure_subscription_ids.split(",") if s.strip()]
+
+    @property
+    def azure_subscription_id(self) -> str | None:
+        """Return the first configured subscription ID.
+
+        Kept for backward compatibility. Prefer subscription_ids when
+        iterating across multiple subscriptions.
+        """
+        ids = self.subscription_ids
+        return ids[0] if ids else None
 
     @property
     def uses_service_principal(self) -> bool:
