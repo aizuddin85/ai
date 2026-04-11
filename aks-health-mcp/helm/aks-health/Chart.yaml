@@ -1,0 +1,18 @@
+apiVersion: v2
+name: aks-health
+description: >-
+  AKS Health MCP Server – production-grade AKS health monitoring with
+  Azure AI Foundry agents and an Azure AD SSO portal.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - aks
+  - kubernetes
+  - azure
+  - monitoring
+  - mcp
+  - azure-ai-foundry
+home: https://github.com/aizuddin85/ai
+maintainers:
+  - name: AKS Health Team

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aks-health.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aks-health.labels" . | nindent 4 }}
+data:
+  # Azure identity
+  AZURE_TENANT_ID:          {{ required "backend.config.azureTenantId is required" .Values.backend.config.azureTenantId | quote }}
+  AZURE_SUBSCRIPTION_IDS:   {{ required "backend.config.azureSubscriptionIds is required" .Values.backend.config.azureSubscriptionIds | quote }}
+
+  # Azure AI Foundry
+  AZURE_FOUNDRY_ENDPOINT:   {{ required "backend.config.azureFoundryEndpoint is required" .Values.backend.config.azureFoundryEndpoint | quote }}
+  AZURE_FOUNDRY_MODEL:      {{ .Values.backend.config.azureFoundryModel | quote }}
+
+  # Azure AD SSO
+  AZURE_AD_APP_CLIENT_ID:   {{ required "backend.config.azureAdAppClientId is required" .Values.backend.config.azureAdAppClientId | quote }}
+  AZURE_AD_ALLOWED_GROUP:   {{ required "backend.config.azureAdAllowedGroup is required" .Values.backend.config.azureAdAllowedGroup | quote }}
+  FRONTEND_ORIGIN:          {{ required "backend.config.frontendOrigin is required" .Values.backend.config.frontendOrigin | quote }}
+
+  # MCP / transport
+  MCP_TRANSPORT:            {{ .Values.backend.config.mcpTransport | quote }}
+  K8S_IN_CLUSTER:           {{ .Values.backend.config.k8sInCluster | quote }}
+
+  # Logging
+  LOG_LEVEL:                {{ .Values.backend.config.logLevel | quote }}
+  LOG_FORMAT:               {{ .Values.backend.config.logFormat | quote }}
