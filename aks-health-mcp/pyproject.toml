@@ -4,22 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aks-health-mcp"
-version = "1.0.0"
-description = "Production-grade MCP server for AKS service health monitoring from Azure and in-cluster"
+version = "2.0.0"
+description = "AKS health agent layer powered by the official Microsoft AKS MCP server (github.com/Azure/aks-mcp)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
-    # MCP SDK
+    # MCP client SDK (used by agents to communicate with the aks-mcp binary)
     "mcp>=1.3.0",
-    # Azure SDK
+    # Azure SDK – identity only; ARM/monitor queries are delegated to the aks-mcp binary
     "azure-identity>=1.19.0",
-    "azure-mgmt-containerservice>=33.0.0",
-    "azure-mgmt-resourcehealth>=1.0.0b6",
-    "azure-mgmt-monitor>=6.0.0",
-    "azure-mgmt-resource>=23.0.0",
-    # Kubernetes
-    "kubernetes>=32.0.0",
     # Azure AI Foundry (for agents)
     "azure-ai-inference>=1.0.0b9",
     # Config / validation
@@ -50,9 +44,6 @@ dev = [
     "ruff>=0.9.0",
     "mypy>=1.13.0",
 ]
-
-[project.scripts]
-aks-health-mcp = "server.main:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["server", "agents"]
