@@ -13,7 +13,8 @@
 #   docker build \
 #     --build-arg VITE_AZURE_AD_CLIENT_ID=<app-reg-client-id> \
 #     --build-arg VITE_AZURE_AD_TENANT_ID=<tenant-id> \
-#     --build-arg VITE_AZURE_AD_ALLOWED_GROUP=<group-object-id> \
+#     --build-arg VITE_APP_NAME="AKS Health Dashboard" \
+#     --build-arg VITE_API_BASE_URL=https://api.aks-health.contoso.com \
 #     -t <registry>/aks-health-frontend:latest \
 #     frontend/
 #
@@ -33,13 +34,12 @@ RUN npm ci --ignore-scripts
 
 COPY . .
 
-# Build-time Azure AD variables (required)
+# Build-time Azure AD variables (all required)
 ARG VITE_AZURE_AD_CLIENT_ID
 ARG VITE_AZURE_AD_TENANT_ID
-ARG VITE_AZURE_AD_ALLOWED_GROUP
-ARG VITE_APP_NAME="AKS Health Dashboard"
-# In production, point to your public backend URL; blank uses Vite proxy (dev only)
-ARG VITE_API_BASE_URL=""
+ARG VITE_APP_NAME
+# Public backend URL for the API proxy (required for production builds)
+ARG VITE_API_BASE_URL
 
 RUN npm run build
 

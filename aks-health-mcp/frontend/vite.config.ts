@@ -10,11 +10,12 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    port: Number(process.env.VITE_DEV_PORT) || 5173,
     proxy: {
-      // Proxy /api requests to the FastAPI backend during development
+      // Proxy /api requests to the FastAPI backend during development.
+      // Set VITE_API_BASE_URL in your shell or frontend/.env to override.
       '/api': {
-        target: 'http://localhost:8000',
+        target: process.env.VITE_API_BASE_URL || 'http://localhost:8000',
         changeOrigin: true,
         secure: false,
       },

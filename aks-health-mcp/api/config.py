@@ -59,8 +59,8 @@ class ApiSettings(Settings):
     # CORS / server
     # ----------------------------------------------------------------
     frontend_origin: str = Field(
-        default="http://localhost:5173",
-        description="Allowed CORS origin for the React frontend.",
+        ...,
+        description="Allowed CORS origin for the React frontend (e.g. https://aks-health.contoso.com).",
     )
     api_host: str = Field(default="0.0.0.0")
     api_port: int = Field(default=8000)

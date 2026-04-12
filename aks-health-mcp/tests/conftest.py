@@ -16,6 +16,7 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
     monkeypatch.setenv("AZURE_FOUNDRY_ENDPOINT", "https://test-project.services.ai.azure.com/models")
     monkeypatch.setenv("AZURE_FOUNDRY_MODEL", "gpt-4o")
+    monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:5173")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("LOG_FORMAT", "console")
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
@@ -27,8 +28,15 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _clear_settings_cache() -> None:
-    """Clear the lru_cache on Settings so env changes take effect."""
+    """
+    Clear all lru_cache singletons before and after every test so that
+    monkeypatched env vars are picked up by Settings/ApiSettings and no
+    cached state leaks between tests.
+    """
     from server.config import get_settings
+    from api.config import get_api_settings
     get_settings.cache_clear()
+    get_api_settings.cache_clear()
     yield
     get_settings.cache_clear()
+    get_api_settings.cache_clear()

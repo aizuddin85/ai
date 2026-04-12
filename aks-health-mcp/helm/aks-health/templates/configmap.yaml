@@ -12,7 +12,7 @@ data:
 
   # Azure AI Foundry
   AZURE_FOUNDRY_ENDPOINT:   {{ required "backend.config.azureFoundryEndpoint is required" .Values.backend.config.azureFoundryEndpoint | quote }}
-  AZURE_FOUNDRY_MODEL:      {{ .Values.backend.config.azureFoundryModel | quote }}
+  AZURE_FOUNDRY_MODEL:      {{ required "backend.config.azureFoundryModel is required" .Values.backend.config.azureFoundryModel | quote }}
 
   # Azure AD SSO
   AZURE_AD_APP_CLIENT_ID:   {{ required "backend.config.azureAdAppClientId is required" .Values.backend.config.azureAdAppClientId | quote }}

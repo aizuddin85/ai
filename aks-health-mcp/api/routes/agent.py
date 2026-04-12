@@ -32,6 +32,7 @@ import uuid
 from collections.abc import AsyncGenerator
 
 import structlog
+import structlog.contextvars
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -118,7 +119,17 @@ async def _run_agent_stream(
     Yields:
         SSE-formatted strings to be sent to the browser.
     """
-    log = logger.bind(query_id=query_id, upn=user.upn)
+    # Bind per-request identity to structlog context vars so that every log
+    # line emitted anywhere in the agent pipeline (root agent, sub-agents,
+    # firewall, reviewer) automatically carries query_id and user_oid.
+    # contextvars are isolated per asyncio task — no cross-session leakage.
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        query_id=query_id,
+        user_oid=user.oid,
+    )
+
+    log = logger.bind(upn=user.upn)
     log.info("agent.query.start", query=query[:200])
 
     yield _sse({"type": "started", "query_id": query_id})
