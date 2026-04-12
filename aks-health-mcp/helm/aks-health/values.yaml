@@ -14,7 +14,6 @@
 #       azureSubscriptionIds: "11111111-1111-1111-1111-111111111111"
 #       azureFoundryEndpoint: "https://<project>.services.ai.azure.com/models"
 #       azureAdAppClientId: "22222222-2222-2222-2222-222222222222"
-#       azureAdAllowedGroup: "33333333-3333-3333-3333-333333333333"
 #       frontendOrigin: "https://aks-health.contoso.com"
 #
 #   frontend:
@@ -77,7 +76,6 @@ backend:
     azureFoundryEndpoint: ""        # REQUIRED  Foundry inference URL
     azureFoundryModel: "gpt-4o"
     azureAdAppClientId: ""          # REQUIRED  Frontend app registration client ID
-    azureAdAllowedGroup: ""         # REQUIRED  AD security group Object ID
     frontendOrigin: ""              # REQUIRED  React app URL (CORS)
 
     # Logging
@@ -89,17 +87,20 @@ backend:
     mcpTransport: "stdio"
 
   # ── Sensitive credentials (stored in a Kubernetes Secret) ────────────────
-  # Leave all three blank to use Azure Workload Identity (recommended).
-  # Set azureClientId + azureClientSecret to use a Service Principal instead.
+  # azureClientSecret : Client secret of the app registration (same app as
+  #                     azureAdAppClientId).  Required for On-Behalf-Of (OBO)
+  #                     token exchange so Azure API calls run as the signed-in
+  #                     user.  Leave blank to use Workload Identity (recommended
+  #                     for production — no secret needed).
+  # azureFoundryApiKey: Leave blank to use the Azure AD credential chain.
   credentials:
-    azureClientId: ""
     azureClientSecret: ""
     azureFoundryApiKey: ""          # Leave blank to use Azure AD credential chain
 
   # ── External secret (optional) ───────────────────────────────────────────
   # If you manage secrets externally (e.g. Azure Key Vault CSI driver or
   # External Secrets Operator) set this to the name of an existing Secret
-  # that contains AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_FOUNDRY_API_KEY.
+  # that contains AZURE_CLIENT_SECRET, AZURE_FOUNDRY_API_KEY.
   # When set, the credentials block above is ignored.
   existingSecret: ""
 

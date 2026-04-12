@@ -4,18 +4,25 @@ API-layer configuration (extends the MCP server settings).
 New settings required for the FastAPI backend:
 
   AZURE_AD_APP_CLIENT_ID   – Client ID of the Azure AD app registration
-                             used for frontend SSO (may differ from the MCP
-                             server's service-principal client ID).
-  AZURE_AD_ALLOWED_GROUP   – Object ID of the AD security group whose
-                             members are authorised to use the UI.
+                             used for frontend SSO.  Validated as the
+                             'aud' claim in every bearer token.
+  AZURE_CLIENT_SECRET      – Client secret of the same app registration.
+                             Used to perform the On-Behalf-Of (OBO) token
+                             exchange so Azure API calls run as the signed-in
+                             user.  Leave blank to fall back to AzureCliCredential
+                             or Managed Identity (Workload Identity).
   FRONTEND_ORIGIN          – CORS-allowed origin, e.g. https://aks-health.contoso.com
   API_HOST / API_PORT      – Uvicorn bind address (default 0.0.0.0:8000).
 
-The app registration must be configured to emit the 'groups' claim:
-  Azure Portal → App Registration → Token configuration →
-  Add groups claim → Security groups.
-If a user belongs to more than 200 groups Azure AD omits the claim and
-sets _claim_names instead; see api/auth/azure_ad.py for the fallback path.
+Authorization model
+-------------------
+Any authenticated Azure AD user may call the API.  Azure RBAC on the
+user's identity determines which subscriptions and resources are returned:
+  - User has Reader on a subscription → clusters are listed and queried.
+  - User lacks access → Azure returns 403, which is surfaced as an error
+    in the tool result.
+
+No AZURE_AD_ALLOWED_GROUP is needed.
 """
 from __future__ import annotations
 
@@ -45,13 +52,6 @@ class ApiSettings(Settings):
         description=(
             "Client ID of the Azure AD app registration used for the frontend SSO. "
             "This is validated as the 'aud' claim in every bearer token."
-        ),
-    )
-    azure_ad_allowed_group: str = Field(
-        ...,
-        description=(
-            "Object ID (GUID) of the Azure AD security group whose members are "
-            "authorised to access the UI. Everyone else receives HTTP 403."
         ),
     )
 

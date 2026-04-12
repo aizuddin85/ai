@@ -230,13 +230,13 @@ async def test_root_agent_runs_sub_agents_concurrently() -> None:
 
     call_order: list[str] = []
 
-    async def slow_azure(query: str) -> str:
+    async def slow_azure(query: str, **kwargs: object) -> str:
         call_order.append("azure_start")
         await asyncio.sleep(0.01)
         call_order.append("azure_end")
         return "azure"
 
-    async def slow_cluster(query: str) -> str:
+    async def slow_cluster(query: str, **kwargs: object) -> str:
         call_order.append("cluster_start")
         await asyncio.sleep(0.01)
         call_order.append("cluster_end")

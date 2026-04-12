@@ -38,10 +38,25 @@ class Settings(BaseSettings):
         ),
     )
 
-    # SP credentials – optional; absence triggers user/CLI auth
-    azure_client_id: str | None = Field(default=None, description="Service principal app ID")
+    # Backend app credentials – used for the On-Behalf-Of (OBO) token exchange.
+    # Set AZURE_CLIENT_SECRET to the client secret of the same app registration
+    # as AZURE_AD_APP_CLIENT_ID.  When set, Azure API calls run as the signed-in
+    # user (inheriting their Azure RBAC).  When blank, falls back to
+    # AzureCliCredential (az login) or ManagedIdentityCredential (Workload Identity).
     azure_client_secret: SecretStr | None = Field(
-        default=None, description="Service principal secret (masked in logs)"
+        default=None,
+        description=(
+            "Client secret of the Azure AD app registration (for OBO exchange). "
+            "Masked in logs."
+        ),
+    )
+
+    # Per-request ARM token injected by the agent layer after OBO exchange.
+    # Set automatically via AZURE_ARM_TOKEN env var in the MCP subprocess;
+    # do not set this manually.
+    azure_arm_token: str | None = Field(
+        default=None,
+        description="OBO-exchanged ARM access token (injected per-request into subprocess).",
     )
 
     # ------------------------------------------------------------------
@@ -127,8 +142,8 @@ class Settings(BaseSettings):
 
     @property
     def uses_service_principal(self) -> bool:
-        """True when SP credentials are fully configured."""
-        return bool(self.azure_client_id and self.azure_client_secret)
+        """True when a client secret is configured (used for OBO or direct auth)."""
+        return bool(self.azure_client_secret)
 
     @property
     def uses_foundry_key_auth(self) -> bool:

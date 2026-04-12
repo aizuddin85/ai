@@ -1,21 +1,22 @@
 /**
  * ProtectedRoute
  *
- * Gate that wraps any route requiring authentication + group membership.
+ * Gate that wraps any route requiring Azure AD authentication.
  *
  * State machine:
- *   MSAL not authenticated → LoginPage (redirect to Azure AD)
- *   MSAL authenticated, group check loading → LoadingSpinner
- *   MSAL authenticated, group check authorized → children
- *   MSAL authenticated, group check unauthorized → AccessDenied
+ *   MSAL not authenticated → redirect to Azure AD login
+ *   MSAL authenticated, backend check loading → LoadingSpinner
+ *   MSAL authenticated, backend confirmed → children
  *   Error → error message
+ *
+ * Any authenticated Azure AD user is allowed through.  Resource-level
+ * access is controlled by Azure RBAC at query time — no AD group check.
  */
 import { useIsAuthenticated, useMsalAuthentication } from '@azure/msal-react'
 import { InteractionType }   from '@azure/msal-browser'
 import { loginRequest }      from '@/authConfig'
 import { useGroupAuth }      from '@/hooks/useGroupAuth'
 import LoadingSpinner        from '@/components/LoadingSpinner'
-import AccessDenied          from '@/components/AccessDenied'
 import type { UserProfile }  from '@/types'
 
 interface Props {
@@ -37,17 +38,13 @@ export default function ProtectedRoute({ children }: Props) {
     )
   }
 
-  // Authenticated but awaiting group check result
+  // Authenticated but awaiting backend confirmation
   if (authState.status === 'loading') {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <LoadingSpinner message="Verifying authorisation…" size="lg" />
+        <LoadingSpinner message="Verifying authentication…" size="lg" />
       </div>
     )
-  }
-
-  if (authState.status === 'unauthorized') {
-    return <AccessDenied reason={authState.reason} />
   }
 
   if (authState.status === 'error') {

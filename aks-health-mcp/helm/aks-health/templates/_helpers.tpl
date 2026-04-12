@@ -78,8 +78,7 @@ Returns true when the chart should create its own Secret
 */}}
 {{- define "aks-health.createSecret" -}}
 {{- if not .Values.backend.existingSecret }}
-{{- if or .Values.backend.credentials.azureClientId
-          .Values.backend.credentials.azureClientSecret
+{{- if or .Values.backend.credentials.azureClientSecret
           .Values.backend.credentials.azureFoundryApiKey }}
 {{- "true" }}
 {{- end }}
@@ -92,7 +91,6 @@ Returns true when the backend pod should mount a credentials secret
 */}}
 {{- define "aks-health.mountSecret" -}}
 {{- if or .Values.backend.existingSecret
-          .Values.backend.credentials.azureClientId
           .Values.backend.credentials.azureClientSecret
           .Values.backend.credentials.azureFoundryApiKey }}
 {{- "true" }}

@@ -19,10 +19,10 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("LOG_FORMAT", "console")
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
-    # Clear any real SP credentials so tests always use mock paths
-    monkeypatch.delenv("AZURE_CLIENT_ID", raising=False)
+    # Clear any real credentials so tests always use mock paths
     monkeypatch.delenv("AZURE_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("AZURE_FOUNDRY_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_ARM_TOKEN", raising=False)
 
 
 @pytest.fixture(autouse=True)

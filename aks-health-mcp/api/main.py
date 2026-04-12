@@ -43,8 +43,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         "api.startup",
         frontend_origin=_settings.frontend_origin,
-        allowed_group=_settings.azure_ad_allowed_group,
         tenant=_settings.azure_tenant_id,
+        obo_enabled=_settings.uses_service_principal,
     )
     yield
     logger.info("api.shutdown")
@@ -55,8 +55,8 @@ app = FastAPI(
     title="AKS Health API",
     description=(
         "Backend API for the AKS Health sysadmin dashboard. "
-        "All endpoints require a valid Azure AD bearer token issued to a "
-        "member of the configured authorised security group."
+        "All endpoints require a valid Azure AD bearer token. "
+        "Resource access is controlled by the user's Azure RBAC role assignments."
     ),
     version="1.0.0",
     docs_url="/api/docs",
