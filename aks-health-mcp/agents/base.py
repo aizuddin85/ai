@@ -51,6 +51,18 @@ logger = get_logger(__name__)
 
 _REPO_ROOT = Path(__file__).parent.parent
 
+# Environment variables to strip before passing the process environment to the
+# aks-mcp child process.  The binary only needs Azure SDK credential vars
+# (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, etc.) and standard
+# system vars (PATH, HOME, KUBECONFIG …).  Foundry-specific secrets are
+# application-layer secrets that the binary has no use for.
+_CHILD_ENV_EXCLUDE: frozenset[str] = frozenset({
+    "AZURE_FOUNDRY_API_KEY",   # Foundry auth secret – not needed by aks-mcp
+    "AZURE_FOUNDRY_ENDPOINT",  # Foundry inference URL – not needed by aks-mcp
+    "AZURE_FOUNDRY_MODEL",     # Foundry model name – not needed by aks-mcp
+    "AZURE_ARM_TOKEN",         # Deprecated OBO token field – not used by aks-mcp
+})
+
 
 class BaseMcpAgent:
     """
@@ -91,10 +103,12 @@ class BaseMcpAgent:
 
         Args:
             query:     Natural-language health question.
-            arm_token: Retained for API compatibility (OBO token from the
-                       frontend SSO flow).  The official aks-mcp binary
-                       uses the standard Azure SDK credential chain rather
-                       than a custom AZURE_ARM_TOKEN env var.
+            arm_token: Retained for API-layer compatibility only.  The
+                       official aks-mcp binary authenticates via the
+                       standard Azure SDK credential chain (Service
+                       Principal env vars / Workload Identity / az login)
+                       and does not accept per-request token injection.
+                       This parameter has no effect on the binary's auth.
         """
         self._log.info("agent.run.start", query=query[:200])
         # Reset tool results for this invocation
@@ -152,13 +166,16 @@ class BaseMcpAgent:
         """
         Build the environment for the aks-mcp child process.
 
-        Passes through the current process environment (which carries Azure
-        credential env vars such as AZURE_TENANT_ID, AZURE_CLIENT_ID,
-        AZURE_CLIENT_SECRET, AZURE_FEDERATED_TOKEN_FILE, etc.) so the
-        official binary can authenticate using the standard Azure SDK
-        credential chain.
+        Passes through Azure credential env vars (AZURE_TENANT_ID,
+        AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_FEDERATED_TOKEN_FILE,
+        PATH, HOME, KUBECONFIG, etc.) so the binary can authenticate via
+        the standard Azure SDK credential chain.
+
+        Foundry-specific secrets and the deprecated AZURE_ARM_TOKEN are
+        excluded — they are not needed by the binary and should not be
+        accessible to a sub-process beyond this application layer.
         """
-        return dict(os.environ)
+        return {k: v for k, v in os.environ.items() if k not in _CHILD_ENV_EXCLUDE}
 
     async def _discover_tools(
         self, session: ClientSession

@@ -51,14 +51,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Per-request ARM token injected by the agent layer after OBO exchange.
-    # Set automatically via AZURE_ARM_TOKEN env var in the MCP subprocess;
-    # do not set this manually.
-    azure_arm_token: str | None = Field(
-        default=None,
-        description="OBO-exchanged ARM access token (injected per-request into subprocess).",
-    )
-
     # ------------------------------------------------------------------
     # AKS MCP server (official Microsoft binary: github.com/Azure/aks-mcp)
     # ------------------------------------------------------------------
