@@ -155,10 +155,17 @@ serviceAccount:
     # azure.workload.identity/client-id: "<MANAGED_IDENTITY_CLIENT_ID>"
 
 # ---------------------------------------------------------------------------
-# RBAC – read-only ClusterRole for Kubernetes API
+# RBAC – local Kubernetes ClusterRole for Kubernetes API
 # ---------------------------------------------------------------------------
+# When AKS Azure RBAC integration is enabled (the default and recommended
+# configuration), set rbac.create=false (the default).  User access is
+# governed by Azure role assignments and enforced by the kube-apiserver;
+# no local ClusterRole is required.
+#
+# Set rbac.create=true ONLY for clusters that do NOT have Azure RBAC enabled
+# and still require local Kubernetes RBAC objects.
 rbac:
-  create: true
+  create: false
 
 # ---------------------------------------------------------------------------
 # Pod-level metadata (labels / annotations applied to all pods)

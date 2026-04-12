@@ -183,21 +183,29 @@ class RootAgent:
             credential = get_azure_credential()
         return ChatCompletionsClient(endpoint=endpoint, credential=credential)
 
-    async def run(self, query: str, arm_token: str | None = None) -> str:
+    async def run(
+        self,
+        query: str,
+        arm_token: str | None = None,
+        k8s_token: str | None = None,
+    ) -> str:
         """
         Process a high-level AKS health query and return a synthesised
         Markdown report.
 
         Args:
             query:     Natural-language health question.
-            arm_token: Optional OBO ARM token to propagate to sub-agents so
-                       Azure SDK calls execute as the signed-in user.
+            arm_token: OBO ARM token propagated to sub-agents so Azure SDK
+                       calls execute as the signed-in user.
+            k8s_token: OBO AKS Kubernetes API token propagated to sub-agents
+                       so Kubernetes API calls use Azure RBAC (no SA needed).
 
         Returns:
             Formatted Markdown health report.
         """
         self._log.info("root_agent.run.start", query=query[:200])
         self._arm_token = arm_token
+        self._k8s_token = k8s_token
         self._all_tool_results = []  # reset for this invocation
         messages: list[Any] = [
             SystemMessage(content=_SYSTEM_PROMPT),
@@ -289,6 +297,7 @@ class RootAgent:
         self._log.info("root_agent.sub_agent.call", tool=tool_name, query=sub_query[:100])
 
         arm_token = getattr(self, "_arm_token", None)
+        k8s_token = getattr(self, "_k8s_token", None)
 
         if tool_name == "query_azure_health":
             result = await self._azure_agent.run(sub_query, arm_token=arm_token)
@@ -296,7 +305,9 @@ class RootAgent:
             self._all_tool_results.extend(self._azure_agent.tool_results)
             return result
         elif tool_name == "query_cluster_health":
-            result = await self._cluster_agent.run(sub_query, arm_token=arm_token)
+            result = await self._cluster_agent.run(
+                sub_query, arm_token=arm_token, k8s_token=k8s_token
+            )
             self._all_tool_results.extend(self._cluster_agent.tool_results)
             return result
         else:

@@ -83,7 +83,12 @@ class BaseMcpAgent:
     # Public interface
     # ------------------------------------------------------------------
 
-    async def run(self, query: str, arm_token: str | None = None) -> str:
+    async def run(
+        self,
+        query: str,
+        arm_token: str | None = None,
+        k8s_token: str | None = None,
+    ) -> str:
         """
         Process a user query end-to-end and return the final text answer.
 
@@ -92,15 +97,18 @@ class BaseMcpAgent:
 
         Args:
             query:     Natural-language health question.
-            arm_token: Optional Azure Resource Manager access token obtained
-                       via OBO exchange.  When provided it is injected into
-                       the MCP server subprocess as AZURE_ARM_TOKEN so all
-                       Azure SDK calls run under the user's identity.
+            arm_token: OBO-exchanged Azure Resource Manager token.  Injected
+                       as AZURE_ARM_TOKEN into the MCP subprocess so Azure SDK
+                       calls run under the signed-in user's identity.
+            k8s_token: OBO-exchanged AKS Kubernetes API token (scoped to the
+                       AKS server application).  Injected as AZURE_K8S_TOKEN
+                       so Kubernetes API calls use Azure RBAC instead of a
+                       local ServiceAccount.
         """
         self._log.info("agent.run.start", query=query[:200])
         # Reset tool results for this invocation
         self.tool_results = []
-        server_env = self._build_server_env(arm_token=arm_token)
+        server_env = self._build_server_env(arm_token=arm_token, k8s_token=k8s_token)
 
         server_params = StdioServerParameters(
             command=_SERVER_CMD[0],
@@ -142,23 +150,39 @@ class BaseMcpAgent:
 
         return ChatCompletionsClient(endpoint=endpoint, credential=credential)
 
-    def _build_server_env(self, arm_token: str | None = None) -> dict[str, str]:
+    def _build_server_env(
+        self,
+        arm_token: str | None = None,
+        k8s_token: str | None = None,
+    ) -> dict[str, str]:
         """
         Build the environment for the MCP server child process.
 
         Always sets stdio transport and injects PYTHONPATH for imports.
-        When arm_token is provided it is passed as AZURE_ARM_TOKEN so the
-        MCP server uses the user's OBO credential instead of a server-level
-        service principal or managed identity.
+
+        arm_token is passed as AZURE_ARM_TOKEN so the MCP server uses the
+        user's OBO credential for Azure ARM API calls.
+
+        k8s_token is passed as AZURE_K8S_TOKEN so the MCP server uses the
+        user's OBO credential for Kubernetes API calls (Azure RBAC on AKS).
+
+        Stale tokens from a previous invocation are explicitly removed so
+        they can never bleed into a subsequent request.
         """
         env = dict(os.environ)
         env["MCP_TRANSPORT"] = "stdio"
         env["PYTHONPATH"] = str(_REPO_ROOT)
+
         if arm_token:
             env["AZURE_ARM_TOKEN"] = arm_token
-        elif "AZURE_ARM_TOKEN" in env:
-            # Don't leak a stale token from a previous invocation
-            del env["AZURE_ARM_TOKEN"]
+        else:
+            env.pop("AZURE_ARM_TOKEN", None)
+
+        if k8s_token:
+            env["AZURE_K8S_TOKEN"] = k8s_token
+        else:
+            env.pop("AZURE_K8S_TOKEN", None)
+
         return env
 
     async def _discover_tools(

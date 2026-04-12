@@ -108,27 +108,57 @@ def _get_cached_credential() -> "TokenCredential":
 
 def get_kubernetes_client() -> tuple[object, object]:
     """
-    Return (CoreV1Api, AppsV1Api) clients, loading config from the
-    appropriate source.
+    Return (CoreV1Api, AppsV1Api) clients authenticated for the caller.
+
+    Authentication priority
+    -----------------------
+    1. AZURE_K8S_TOKEN is set (per-request OBO token injected by the API layer)
+       → Azure RBAC mode: cluster server + CA are read from kubeconfig or
+         in-cluster config, then the bearer token is replaced with the user's
+         OBO token scoped to the AKS server application.  Azure RBAC role
+         assignments on the user's identity control what Kubernetes resources
+         are returned.  No local ClusterRole/ServiceAccount needed.
+    2. AZURE_K8S_TOKEN absent
+       → Local developer mode: the full kubeconfig (including its auth
+         stanza) is used unchanged.  Run `kubelogin convert-kubeconfig`
+         or `az aks get-credentials` before using this path.
 
     Returns a tuple so callers don't need to import kubernetes directly.
     """
     from kubernetes import client as k8s_client
     from kubernetes import config as k8s_config
 
-    in_cluster_forced = os.getenv("K8S_IN_CLUSTER", "false").lower() == "true"
-    in_cluster_auto = bool(os.getenv("KUBERNETES_SERVICE_HOST"))
+    k8s_token = os.getenv("AZURE_K8S_TOKEN", "").strip()
+    in_cluster = (
+        os.getenv("K8S_IN_CLUSTER", "false").lower() == "true"
+        or bool(os.getenv("KUBERNETES_SERVICE_HOST"))
+    )
 
-    if in_cluster_forced or in_cluster_auto:
-        logger.info("k8s.auth.mode", mode="in_cluster")
+    # Load server URL + CA cert from kubeconfig or in-cluster projection.
+    # The auth stanza is overridden below when running in Azure RBAC mode.
+    if in_cluster:
         k8s_config.load_incluster_config()
     else:
         kubeconfig = os.getenv("KUBECONFIG") or None
         context = os.getenv("K8S_CONTEXT") or None
-        logger.info("k8s.auth.mode", mode="kubeconfig", context=context or "default")
         k8s_config.load_kube_config(config_file=kubeconfig, context=context)
 
     configuration = k8s_client.Configuration.get_default_copy()
+
+    if k8s_token:
+        # Override service-account / kubeconfig auth with the user's OBO token.
+        # AKS (Azure RBAC enabled) validates the token against Azure AD and
+        # enforces role assignments without any local RBAC objects.
+        configuration.api_key = {"authorization": f"Bearer {k8s_token}"}
+        configuration.api_key_prefix = {}
+        logger.info("k8s.auth.mode", mode="azure_rbac_obo")
+    else:
+        logger.info(
+            "k8s.auth.mode",
+            mode="kubeconfig",
+            in_cluster=in_cluster,
+        )
+
     api_client = k8s_client.ApiClient(configuration)
     return (
         k8s_client.CoreV1Api(api_client),

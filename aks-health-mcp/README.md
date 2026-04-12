@@ -853,7 +853,7 @@ The full list of configurable values with their defaults:
 | `ingress.tls.secretName` | `""` | TLS secret name (auto-generated if blank) |
 | `serviceAccount.create` | `true` | Create ServiceAccount |
 | `serviceAccount.annotations` | `{}` | Annotations (Workload Identity client-id) |
-| `rbac.create` | `true` | Create read-only ClusterRole + binding |
+| `rbac.create` | `false` | Create read-only ClusterRole + binding (non-Azure-RBAC clusters only) |
 | `imagePullSecrets` | `[]` | Image pull secrets list |
 | `podAnnotations` | `{}` | Annotations on all pods |
 | `podLabels` | `{}` | Extra labels on all pods |
@@ -911,20 +911,47 @@ Required Azure RBAC roles on the **user's identity** (or their AD groups):
 | 1 | API key (`AzureKeyCredential`) | `AZURE_FOUNDRY_API_KEY` is set |
 | 2 | Server-level Azure AD credential | Key not set (OBO does not apply here) |
 
-### Kubernetes
+### Kubernetes (AKS Azure RBAC mode — recommended)
+
+AKS clusters with **Azure RBAC integration** enabled authenticate Kubernetes API calls against Azure AD.  When a user submits a query the backend exchanges their Azure AD token for a Kubernetes bearer token scoped to the AKS server application (`6dae42f8-4368-4678-94ff-3960e28e3630`) via the OBO flow.  That token is injected into the MCP subprocess as `AZURE_K8S_TOKEN`; the kube-apiserver validates it and enforces the user's Azure role assignments.
+
+**No ServiceAccount token, ClusterRole, or ClusterRoleBinding is required.**
 
 | Priority | Method | When used |
 |----------|--------|-----------|
-| 1 | In-cluster ServiceAccount | `KUBERNETES_SERVICE_HOST` set or `K8S_IN_CLUSTER=true` |
-| 2 | Kubeconfig | `KUBECONFIG` env or `~/.kube/config` |
+| 1 | OBO Kubernetes token (`AZURE_K8S_TOKEN`) | AKS Azure RBAC enabled + `AZURE_CLIENT_SECRET` configured |
+| 2 | Kubeconfig / in-cluster config unchanged | OBO token absent (local dev without client secret) |
 
-Kubernetes tools always use the server's own ServiceAccount — they are not subject to OBO.
+Required Azure role assignment for **each user** on each AKS cluster they want to inspect:
+
+```bash
+# Grant read-only Kubernetes access (Azure RBAC — no local ClusterRole needed)
+az role assignment create \
+  --assignee <user-email-or-object-id> \
+  --role "Azure Kubernetes Service RBAC Reader" \
+  --scope /subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.ContainerService/managedClusters/<cluster>
+```
+
+You can scope the role to a subscription or resource group to cover all clusters at once.
+
+#### App registration API permissions (one-time setup)
+
+For the OBO K8s token exchange to work, the app registration must have a delegated permission on the AKS server application:
+
+1. Azure Portal → **App registrations** → your app → **API permissions**
+2. Click **+ Add a permission** → **APIs my organization uses**
+3. Search for **Azure Kubernetes Service AAD Server** (app ID `6dae42f8-4368-4678-94ff-3960e28e3630`)
+4. Select **Delegated permissions** → tick **user_impersonation**
+5. Click **Grant admin consent**
 
 ---
 
-## Kubernetes RBAC
+## Kubernetes RBAC (legacy — non-Azure-RBAC clusters only)
 
-If running the MCP server inside an AKS pod, create this read-only ClusterRole:
+> This section applies only if your AKS cluster does **not** have Azure RBAC integration enabled.
+> For all new clusters leave `rbac.create=false` (the Helm default) and use Azure RBAC instead.
+
+If your cluster uses local Kubernetes RBAC you must create a ClusterRole and bind it to the pod's ServiceAccount:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -941,16 +968,15 @@ rules:
   verbs: ["get", "list", "watch"]
 ```
 
-Apply it:
-
 ```bash
 kubectl apply -f clusterrole.yaml
 
-# Bind to the pod's ServiceAccount
 kubectl create clusterrolebinding aks-health-mcp-reader \
   --clusterrole=aks-health-mcp-reader \
   --serviceaccount=<namespace>:<serviceaccount-name>
 ```
+
+Enable in Helm with `--set rbac.create=true`.
 
 ---
 

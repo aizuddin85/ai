@@ -59,6 +59,18 @@ class Settings(BaseSettings):
         description="OBO-exchanged ARM access token (injected per-request into subprocess).",
     )
 
+    # Per-request Kubernetes API token injected by the agent layer after OBO
+    # exchange against the AKS server application (6dae42f8-…).
+    # Set automatically via AZURE_K8S_TOKEN env var in the MCP subprocess;
+    # do not set this manually.
+    azure_k8s_token: str | None = Field(
+        default=None,
+        description=(
+            "OBO-exchanged AKS Kubernetes API token (injected per-request into subprocess). "
+            "Used when AKS Azure RBAC integration is enabled — replaces ServiceAccount auth."
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Kubernetes authentication
     # ------------------------------------------------------------------

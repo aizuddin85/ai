@@ -24,6 +24,7 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AZURE_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("AZURE_FOUNDRY_API_KEY", raising=False)
     monkeypatch.delenv("AZURE_ARM_TOKEN", raising=False)
+    monkeypatch.delenv("AZURE_K8S_TOKEN", raising=False)
 
 
 @pytest.fixture(autouse=True)

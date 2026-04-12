@@ -63,33 +63,65 @@ class QueryRequest(BaseModel):
 # OBO token exchange
 # ---------------------------------------------------------------------------
 
+# AKS Kubernetes API server application ID (fixed across all Azure public
+# cloud regions — this is the well-known first-party AKS server app).
+_AKS_SERVER_APP_ID = "6dae42f8-4368-4678-94ff-3960e28e3630"
 
-def _exchange_obo_token(user_token: str, settings: ApiSettings) -> str | None:
-    """
-    Exchange the user's Azure AD access token for an Azure Resource Manager
-    token using the On-Behalf-Of (OBO) flow.
 
-    Returns the ARM access token string, or None if OBO is not configured
-    (i.e. AZURE_CLIENT_SECRET is absent — fallback to server-level credential).
-    """
+def _make_obo_credential(user_token: str, settings: ApiSettings):  # type: ignore[return]
+    """Return an OnBehalfOfCredential for user_token, or None if not configured."""
+    from azure.identity import OnBehalfOfCredential
+
     client_secret = settings.azure_client_secret
     if not client_secret:
         return None
+    return OnBehalfOfCredential(
+        tenant_id=settings.azure_tenant_id,
+        client_id=settings.azure_ad_app_client_id,
+        client_secret=client_secret.get_secret_value(),
+        user_assertion=user_token,
+    )
 
+
+def _exchange_obo_token(user_token: str, settings: ApiSettings) -> str | None:
+    """
+    Exchange the user's Azure AD token for an Azure Resource Manager token.
+
+    Returns the ARM access token, or None when OBO is not configured
+    (fallback: server-level Workload Identity / az login credential).
+    """
     try:
-        from azure.identity import OnBehalfOfCredential
-
-        obo_cred = OnBehalfOfCredential(
-            tenant_id=settings.azure_tenant_id,
-            client_id=settings.azure_ad_app_client_id,
-            client_secret=client_secret.get_secret_value(),
-            user_assertion=user_token,
-        )
-        token_obj = obo_cred.get_token("https://management.azure.com/.default")
-        logger.info("obo.exchange.success")
-        return token_obj.token
+        cred = _make_obo_credential(user_token, settings)
+        if cred is None:
+            return None
+        token = cred.get_token("https://management.azure.com/.default").token
+        logger.info("obo.arm.exchange.success")
+        return token
     except Exception as exc:  # noqa: BLE001
-        logger.warning("obo.exchange.failed", error=str(exc))
+        logger.warning("obo.arm.exchange.failed", error=str(exc))
+        return None
+
+
+def _exchange_k8s_obo_token(user_token: str, settings: ApiSettings) -> str | None:
+    """
+    Exchange the user's Azure AD token for an AKS Kubernetes API token.
+
+    The token is scoped to the AKS server application so the Kubernetes API
+    server can validate it.  Azure RBAC role assignments on the user's
+    identity then control which Kubernetes resources are accessible —
+    no local ClusterRole or ServiceAccount needed.
+
+    Returns the Kubernetes bearer token, or None when OBO is not configured.
+    """
+    try:
+        cred = _make_obo_credential(user_token, settings)
+        if cred is None:
+            return None
+        token = cred.get_token(f"{_AKS_SERVER_APP_ID}/.default").token
+        logger.info("obo.k8s.exchange.success")
+        return token
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("obo.k8s.exchange.failed", error=str(exc))
         return None
 
 
@@ -171,13 +203,14 @@ async def _run_agent_stream(
                 "message": "Querying Azure and cluster health (this may take 15–30 s)…",
             })
 
-            # Exchange user token for ARM token (OBO).  Falls back to
-            # server-level credential (Workload Identity / az login) when
-            # AZURE_CLIENT_SECRET is not configured.
+            # Exchange user token for ARM and Kubernetes tokens (OBO).
+            # Falls back to server-level credential when AZURE_CLIENT_SECRET
+            # is not configured.
             arm_token = _exchange_obo_token(user.access_token, settings)
+            k8s_token = _exchange_k8s_obo_token(user.access_token, settings)
 
             agent = RootAgent()
-            result = await agent.run(query, arm_token=arm_token)
+            result = await agent.run(query, arm_token=arm_token, k8s_token=k8s_token)
 
             log.info("agent.query.done", result_length=len(result))
             yield _sse({"type": "result", "query_id": query_id, "content": result})

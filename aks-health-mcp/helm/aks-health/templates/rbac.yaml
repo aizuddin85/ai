@@ -1,6 +1,15 @@
+# ClusterRole and ClusterRoleBinding are not required when AKS Azure RBAC
+# integration is enabled (recommended).  In Azure RBAC mode the kube-apiserver
+# validates the user's OBO-exchanged Azure AD token and enforces Azure role
+# assignments (e.g. "Azure Kubernetes Service RBAC Reader") — no local
+# ClusterRole or ServiceAccount is needed.
+#
+# This file is kept as a no-op placeholder.  Set rbac.create=true only if you
+# are running against a cluster that does NOT have Azure RBAC enabled and still
+# requires local Kubernetes RBAC objects.
 {{- if .Values.rbac.create }}
 # Read-only ClusterRole for the Kubernetes API tools (k8s_* MCP tools).
-# Grants get/list/watch on the same resources as the manual RBAC in the README.
+# Only required when AKS Azure RBAC integration is NOT enabled on the cluster.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
