@@ -48,6 +48,7 @@ from azure.ai.inference.models import (
 )
 from azure.core.credentials import AzureKeyCredential
 
+from agents.reviewer import review_response
 from agents.task_agents.azure_health_agent import AzureHealthAgent
 from agents.task_agents.cluster_health_agent import ClusterHealthAgent
 from server.auth.credentials import get_azure_credential
@@ -156,11 +157,14 @@ class RootAgent:
 
     def __init__(self) -> None:
         settings = get_settings()
+        self._settings = settings
         self._model = settings.azure_foundry_model
         self._foundry_client = self._build_client(settings)
         self._azure_agent = AzureHealthAgent()
         self._cluster_agent = ClusterHealthAgent()
         self._log = get_logger("agent.root")
+        # Accumulated raw tool results from all sub-agents (for hallucination review)
+        self._all_tool_results: list[str] = []
 
     @staticmethod
     def _build_client(settings: Any) -> ChatCompletionsClient:
@@ -194,6 +198,7 @@ class RootAgent:
         """
         self._log.info("root_agent.run.start", query=query[:200])
         self._arm_token = arm_token
+        self._all_tool_results = []  # reset for this invocation
         messages: list[Any] = [
             SystemMessage(content=_SYSTEM_PROMPT),
             UserMessage(content=query),
@@ -219,7 +224,16 @@ class RootAgent:
                 finish_reason == CompletionsFinishReason.STOPPED
                 or not getattr(message, "tool_calls", None)
             ):
-                final_answer = message.content or ""
+                draft = message.content or ""
+                self._log.info("root_agent.draft_ready", draft_length=len(draft))
+
+                # Run hallucination review before returning to the user
+                final_answer = await review_response(
+                    query=query,
+                    tool_results="\n\n".join(self._all_tool_results),
+                    draft_answer=draft,
+                    settings=self._settings,
+                )
                 self._log.info("root_agent.run.done", answer_length=len(final_answer))
                 return final_answer
 
@@ -236,7 +250,7 @@ class RootAgent:
             messages.extend(tool_results)
 
         self._log.warning("root_agent.max_iterations_reached", max=max_iterations)
-        return "Maximum orchestration iterations reached. Please narrow your query."
+        return "Maximum orchestration iterations reached. Please narrow your query or try again."
 
     async def _dispatch_tools(
         self, tool_calls: list[Any]
@@ -277,9 +291,14 @@ class RootAgent:
         arm_token = getattr(self, "_arm_token", None)
 
         if tool_name == "query_azure_health":
-            return await self._azure_agent.run(sub_query, arm_token=arm_token)
+            result = await self._azure_agent.run(sub_query, arm_token=arm_token)
+            # Accumulate raw MCP tool results for hallucination review
+            self._all_tool_results.extend(self._azure_agent.tool_results)
+            return result
         elif tool_name == "query_cluster_health":
-            return await self._cluster_agent.run(sub_query, arm_token=arm_token)
+            result = await self._cluster_agent.run(sub_query, arm_token=arm_token)
+            self._all_tool_results.extend(self._cluster_agent.tool_results)
+            return result
         else:
             return json.dumps({"error": f"Unknown sub-agent tool: {tool_name}"})
 
