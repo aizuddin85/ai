@@ -13,7 +13,6 @@ _BASE = dict(
 
 
 def test_settings_with_sp_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AZURE_CLIENT_ID", "client-id-123")
     monkeypatch.setenv("AZURE_CLIENT_SECRET", "super-secret")
     s = Settings(**_BASE)  # type: ignore[arg-type]
     assert s.uses_service_principal is True

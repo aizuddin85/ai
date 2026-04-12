@@ -1,5 +1,5 @@
 """
-Azure AD JWT validation and group-membership guard.
+Azure AD JWT validation.
 
 Token validation flow
 ---------------------
@@ -7,23 +7,18 @@ Token validation flow
 2. Decode the JWT header to get the key-ID (kid).
 3. Fetch (and cache for 1 hour) the JWKS from Azure AD's discovery endpoint.
 4. Verify the signature, expiry, issuer, and audience.
-5. Check that the required AD group OID appears in the 'groups' claim.
 
-Over-200-groups fallback
-------------------------
-If the user is a member of more than 200 groups, Azure AD omits the
-'groups' claim and sets:
-  "_claim_names": {"groups": "src1"}
-  "_claim_sources": {"src1": {"endpoint": "<graph-url>"}}
+Authorization model
+-------------------
+Any successfully authenticated Azure AD user is allowed access to the API.
+Resource-level authorization is enforced downstream through Azure RBAC:
+the backend exchanges the user's token for an Azure Resource Manager token
+via the On-Behalf-Of (OBO) flow.  Azure then returns only the resources the
+user's identity (and their group-based role assignments) can actually access.
+Users whose identities have no Azure RBAC roles on a subscription will
+receive empty results or 403 errors from Azure — not from this module.
 
-In that scenario this module calls Microsoft Graph on behalf of the user
-(using their bearer token, which must have GroupMember.Read.All delegated
-permission) to perform a transitive memberOf check.
-
-The app registration manifest must include:
-  "groupMembershipClaims": "SecurityGroup"
-and optionally:
-  "optionalClaims": { "idToken": [{"name": "groups", ...}] }
+No group claim or AZURE_AD_ALLOWED_GROUP configuration is required.
 """
 from __future__ import annotations
 
@@ -135,121 +130,6 @@ async def _validate_token(
 
 
 # ---------------------------------------------------------------------------
-# Group membership check
-# ---------------------------------------------------------------------------
-
-
-async def _check_group_membership(
-    claims: dict[str, Any],
-    token: str,
-    required_group: str,
-) -> None:
-    """
-    Verify the user belongs to the required AD group.
-
-    Primary path: inspect the 'groups' claim in the JWT.
-    Fallback path: call Microsoft Graph transitiveMemberOf when the groups
-                   claim is absent (user in >200 groups).
-
-    Raises HTTP 403 if not a member.
-    """
-    groups_in_token: list[str] | None = claims.get("groups")
-
-    if groups_in_token is not None:
-        if required_group in groups_in_token:
-            logger.info(
-                "auth.group.authorized",
-                upn=claims.get("upn") or claims.get("preferred_username"),
-                group=required_group,
-            )
-            return
-        _deny(claims, required_group)
-
-    # ── Fallback: groups claim absent → call Graph API ───────────────
-    # This requires the delegated permission GroupMember.Read.All on the
-    # frontend app registration.
-    if "_claim_names" in claims and "groups" in claims.get("_claim_names", {}):
-        logger.info("auth.group.graph_fallback", oid=claims.get("oid"))
-        await _graph_check(token, claims.get("oid", ""), required_group, claims)
-        return
-
-    # No groups claim and no _claim_names → deny (configuration issue)
-    logger.warning(
-        "auth.group.no_groups_claim",
-        oid=claims.get("oid"),
-        hint="Add 'groupMembershipClaims': 'SecurityGroup' to the app manifest",
-    )
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail=(
-            "Token contains no groups claim. "
-            "Configure the app registration to emit group claims "
-            "(Token configuration → Add groups claim → Security groups)."
-        ),
-    )
-
-
-async def _graph_check(
-    bearer_token: str,
-    user_oid: str,
-    required_group: str,
-    claims: dict[str, Any],
-) -> None:
-    """Call MS Graph /me/transitiveMemberOf to check group membership."""
-    url = "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group"
-    headers = {"Authorization": f"Bearer {bearer_token}"}
-    params = {"$select": "id", "$top": "999"}
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, headers=headers, params=params)
-            if resp.status_code == 403:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=(
-                        "Cannot verify group membership via Microsoft Graph. "
-                        "Ensure the app has GroupMember.Read.All delegated permission."
-                    ),
-                )
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
-        logger.error("auth.graph.error", error=str(exc))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unable to verify group membership via Microsoft Graph",
-        ) from exc
-
-    group_ids = {
-        g["id"]
-        for g in data.get("value", [])
-        if isinstance(g, dict) and "id" in g
-    }
-    if required_group in group_ids:
-        logger.info(
-            "auth.group.authorized_via_graph",
-            upn=claims.get("upn") or claims.get("preferred_username"),
-            group=required_group,
-        )
-        return
-
-    _deny(claims, required_group)
-
-
-def _deny(claims: dict[str, Any], group: str) -> None:
-    logger.warning(
-        "auth.group.denied",
-        upn=claims.get("upn") or claims.get("preferred_username"),
-        oid=claims.get("oid"),
-        required_group=group,
-    )
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="You are not a member of the authorised group for this application.",
-    )
-
-
-# ---------------------------------------------------------------------------
 # FastAPI dependency
 # ---------------------------------------------------------------------------
 
@@ -257,7 +137,7 @@ def _deny(claims: dict[str, Any], group: str) -> None:
 class AuthenticatedUser:
     """Carries verified identity information about the authenticated caller."""
 
-    def __init__(self, claims: dict[str, Any]) -> None:
+    def __init__(self, claims: dict[str, Any], access_token: str = "") -> None:
         self.oid: str = claims.get("oid", "")
         self.upn: str = (
             claims.get("upn") or claims.get("preferred_username") or "unknown"
@@ -266,6 +146,8 @@ class AuthenticatedUser:
         self.email: str = claims.get("email") or self.upn
         self.groups: list[str] = claims.get("groups", [])
         self.raw_claims = claims
+        # Raw bearer token — used downstream for OBO exchange
+        self.access_token: str = access_token
 
 
 async def get_current_user(
@@ -273,14 +155,15 @@ async def get_current_user(
     settings: ApiSettings = Depends(get_api_settings),
 ) -> AuthenticatedUser:
     """
-    FastAPI dependency that:
-      1. Validates the Azure AD bearer token.
-      2. Asserts group membership.
-      3. Returns the authenticated user.
+    FastAPI dependency that validates the Azure AD bearer token and returns
+    the authenticated user.
+
+    Authorization is purely based on a valid Azure AD token — no AD group
+    membership check is performed here.  Resource access is controlled by
+    the user's Azure RBAC role assignments evaluated at query time via OBO.
 
     Inject with:  user: AuthenticatedUser = Depends(get_current_user)
     """
     token = credentials.credentials
     claims = await _validate_token(token, settings)
-    await _check_group_membership(claims, token, settings.azure_ad_allowed_group)
-    return AuthenticatedUser(claims)
+    return AuthenticatedUser(claims, access_token=token)

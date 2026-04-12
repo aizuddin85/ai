@@ -2,7 +2,7 @@
 
 Production-grade **Model Context Protocol (MCP) server** for monitoring Azure Kubernetes Service (AKS) health from both the **Azure control plane** and the **live in-cluster Kubernetes API**.
 
-Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **React sysadmin portal** with Azure AD SSO enforced at the AD security-group level.
+Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **React sysadmin portal** with Azure AD SSO. Access to Azure resources is governed by each user's **Azure RBAC role assignments** — no hard-coded group configuration required.
 
 ---
 
@@ -15,9 +15,8 @@ Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **Rea
    - [Find Your Tenant ID and Subscription ID](#1-find-your-tenant-id-and-subscription-id)
    - [Create an App Registration](#2-create-an-app-registration)
    - [Configure the App Registration](#3-configure-the-app-registration)
-   - [Create a Service Principal](#4-create-a-service-principal-optional--for-ci--robotic-access)
-   - [Create or Find an AD Security Group](#5-create-or-find-an-ad-security-group)
-   - [Set Up Azure AI Foundry](#6-set-up-azure-ai-foundry)
+   - [Assign Azure RBAC Roles to Users](#4-assign-azure-rbac-roles-to-users)
+   - [Set Up Azure AI Foundry](#5-set-up-azure-ai-foundry)
 5. [Installation](#installation)
 6. [Configuration](#configuration)
    - [Backend `.env`](#backend-env)
@@ -190,87 +189,62 @@ After creating the registration, you need three more steps.
    - **Admin consent description**: `Allows the app to access the AKS Health Portal on behalf of the signed-in user`
 5. Click **Add scope**.
 
-#### 3b. Add groups claim to tokens
+#### 3b. Add a client secret (for On-Behalf-Of token exchange)
 
-This makes Azure AD include the user's group memberships in the JWT token.
+The backend needs a client secret to perform the **On-Behalf-Of (OBO)** flow — exchanging the user's login token for an Azure Resource Manager token so API calls run as the signed-in user.
 
-1. From your app registration, go to **Token configuration**.
-2. Click **+ Add groups claim**.
-3. Select **Security groups**.
-4. Under **ID**, **Access**, and **SAML** columns, make sure **Group ID** is checked.
-5. Click **Add**.
+1. From your app registration, go to **Certificates & secrets**.
+2. Click **+ New client secret**.
+3. Enter a description (e.g. `aks-health-backend`) and choose an expiry.
+4. Click **Add**.
+5. Copy the **Value** immediately — it will not be shown again.  
+   This is your `AZURE_CLIENT_SECRET` in `.env`.
 
 #### 3c. Grant API permissions
 
 1. From your app registration, go to **API permissions**.
 2. Click **+ Add a permission**.
-3. Select **Microsoft Graph** → **Delegated permissions**.
-4. Add: `openid`, `profile`, `email`.
-5. Optionally add `GroupMember.Read.All` (required only if users are members of more than 200 groups).
+3. Select **Microsoft Graph** → **Delegated permissions** → add: `openid`, `profile`, `email`.
+4. Click **+ Add a permission** again.
+5. Select **Azure Service Management** → **Delegated permissions** → add: `user_impersonation`.  
+   *(This allows the backend to call Azure Resource Manager on behalf of the user.)*
 6. Click **Add permissions**.
 7. Click **Grant admin consent for [your tenant]** and confirm.
 
 ---
 
-### 4. Create a Service Principal (optional — for CI / robotic access)
+### 4. Assign Azure RBAC Roles to Users
 
-Skip this step if you will only use `az login` (developer/local access). A service principal is needed for automated pipelines or production deployments where no human login is possible.
+Access to Azure resources is controlled by each user's Azure RBAC role assignments. Users (or their AD groups) must have at least the following roles on the subscriptions they want to query:
 
-```bash
-# Log in first
-az login
+| Role | Purpose |
+|------|---------|
+| `Reader` | List AKS clusters, node pools, resource health, upgrade profiles |
+| `Monitoring Reader` | Read Azure Monitor metrics (CPU, memory, pod counts) |
 
-# Create the service principal and assign Reader role
-az ad sp create-for-rbac \
-  --name "aks-health-mcp-sp" \
-  --role Reader \
-  --scopes /subscriptions/<your-subscription-id>
-
-# The output will show:
-# {
-#   "appId":       "<AZURE_CLIENT_ID>",
-#   "password":    "<AZURE_CLIENT_SECRET>",
-#   "tenant":      "<AZURE_TENANT_ID>"
-# }
-```
-
-Save the `appId` and `password` — you will need them for `.env`.
-
-Also assign the **Monitoring Reader** role so the SP can read Azure Monitor metrics:
+**Assign a role:**
 
 ```bash
+# Assign Reader to a specific user
 az role assignment create \
-  --assignee <appId> \
+  --assignee <user-email-or-object-id> \
+  --role Reader \
+  --scope /subscriptions/<subscription-id>
+
+# Assign Monitoring Reader to the same user
+az role assignment create \
+  --assignee <user-email-or-object-id> \
   --role "Monitoring Reader" \
-  --scope /subscriptions/<your-subscription-id>
+  --scope /subscriptions/<subscription-id>
 ```
 
----
+You can also assign roles to an **AD security group** — all group members inherit the roles automatically. This is the recommended approach for team access control.
 
-### 5. Create or Find an AD Security Group
-
-Only members of this group will be allowed to use the dashboard.
-
-**Create a new group:**
-
-1. In the Azure Portal, search for **Groups** and select it.
-2. Click **+ New group**.
-3. Fill in:
-   - **Group type**: Security
-   - **Group name**: `aks-sysadmins` (or any name)
-4. Under **Members**, add the users who should have access.
-5. Click **Create**.
-6. Open the group you just created, go to **Overview**, and copy the **Object ID** (a GUID).  
-   This is your `AZURE_AD_ALLOWED_GROUP` and `VITE_AZURE_AD_ALLOWED_GROUP`.
-
-**Use an existing group:**
-
-1. In the Azure Portal, search for **Groups**, find your group.
-2. Click the group → **Overview** → copy the **Object ID**.
+> **How access works:** When a user logs in and submits a query, the backend exchanges their Azure AD token for an Azure Resource Manager token (OBO flow). Azure evaluates the user's RBAC roles and returns only the resources they can access. Users without any role on a subscription will see empty results or access-denied errors from Azure — not a login failure.
 
 ---
 
-### 6. Set Up Azure AI Foundry
+### 5. Set Up Azure AI Foundry
 
 Azure AI Foundry hosts the LLM model that powers the health agents.
 
@@ -331,7 +305,7 @@ cp .env.example .env
 Open `.env` in a text editor. Below is a description of every field:
 
 ```bash
-# ── Azure Authentication ──────────────────────────────────────────────────────
+# ── Azure Tenant ──────────────────────────────────────────────────────────────
 # Your Azure AD Tenant ID (GUID from Step 1)
 AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000
 
@@ -341,9 +315,15 @@ AZURE_SUBSCRIPTION_IDS=11111111-1111-1111-1111-111111111111
 # Multiple subscriptions (aks_list_clusters and health events iterate all of them):
 # AZURE_SUBSCRIPTION_IDS=11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222
 
-# Service principal credentials (from Step 4).
-# Leave blank if using `az login` for local development.
-AZURE_CLIENT_ID=
+# ── App Registration ──────────────────────────────────────────────────────────
+# Application (client) ID of your app registration (from Step 2)
+AZURE_AD_APP_CLIENT_ID=22222222-2222-2222-2222-222222222222
+
+# Client secret of the SAME app registration (from Step 3b).
+# Used for the On-Behalf-Of (OBO) token exchange: Azure API calls run as
+# the signed-in user, so their Azure RBAC determines what they can access.
+# Leave blank to fall back to `az login` (local dev) or Workload Identity
+# (AKS pod). Without this, all users see the same resources as the server.
 AZURE_CLIENT_SECRET=
 
 # ── Kubernetes ────────────────────────────────────────────────────────────────
@@ -362,18 +342,14 @@ MCP_HOST=127.0.0.1
 MCP_PORT=8090
 
 # ── Azure AI Foundry ──────────────────────────────────────────────────────────
-# Inference endpoint URL from Step 6
+# Inference endpoint URL from Step 5
 AZURE_FOUNDRY_ENDPOINT=https://<project-name>.services.ai.azure.com/models
-# The model deployment name from Step 6
+# The model deployment name from Step 5
 AZURE_FOUNDRY_MODEL=gpt-4o
-# API key from Step 6. Leave blank to use Azure AD credential chain instead.
+# API key from Step 5. Leave blank to use Azure AD credential chain instead.
 AZURE_FOUNDRY_API_KEY=
 
-# ── Frontend / SSO ────────────────────────────────────────────────────────────
-# Application (client) ID of your app registration (from Step 2)
-AZURE_AD_APP_CLIENT_ID=22222222-2222-2222-2222-222222222222
-# Object ID of the AD security group (from Step 5)
-AZURE_AD_ALLOWED_GROUP=33333333-3333-3333-3333-333333333333
+# ── Frontend / CORS ───────────────────────────────────────────────────────────
 # URL of the React frontend (for CORS). Default is fine for local dev.
 FRONTEND_ORIGIN=http://localhost:5173
 
@@ -400,9 +376,6 @@ VITE_AZURE_AD_CLIENT_ID=22222222-2222-2222-2222-222222222222
 
 # Tenant ID — same value as AZURE_TENANT_ID above
 VITE_AZURE_AD_TENANT_ID=00000000-0000-0000-0000-000000000000
-
-# Allowed group Object ID — same value as AZURE_AD_ALLOWED_GROUP above
-VITE_AZURE_AD_ALLOWED_GROUP=33333333-3333-3333-3333-333333333333
 
 # Leave blank for local development (Vite proxies /api → localhost:8000)
 VITE_API_BASE_URL=
@@ -467,7 +440,7 @@ You should see:
 
 Browse to **http://localhost:5173** in your browser.
 
-You will be redirected to the Microsoft login page. Sign in with an account that is a member of the AD security group you configured. After login you will land on the AKS Health Dashboard.
+You will be redirected to the Microsoft login page. Sign in with any Azure AD account in your tenant. After login you will land on the AKS Health Dashboard. The resources shown are determined by your Azure RBAC role assignments.
 
 ### Step 5 — Run a health query
 
@@ -848,12 +821,10 @@ The full list of configurable values with their defaults:
 | `backend.config.azureFoundryEndpoint` | `""` | **Required.** Azure AI Foundry endpoint URL |
 | `backend.config.azureFoundryModel` | `"gpt-4o"` | Foundry model deployment name |
 | `backend.config.azureAdAppClientId` | `""` | **Required.** App registration client ID |
-| `backend.config.azureAdAllowedGroup` | `""` | **Required.** AD security group Object ID |
 | `backend.config.frontendOrigin` | `""` | **Required.** Frontend URL (CORS allow-origin) |
 | `backend.config.logLevel` | `"INFO"` | Log level |
 | `backend.config.logFormat` | `"json"` | `json` or `console` |
-| `backend.credentials.azureClientId` | `""` | Service principal client ID |
-| `backend.credentials.azureClientSecret` | `""` | Service principal secret |
+| `backend.credentials.azureClientSecret` | `""` | App registration client secret (for OBO) |
 | `backend.credentials.azureFoundryApiKey` | `""` | Azure AI Foundry API key |
 | `backend.existingSecret` | `""` | Name of pre-existing Kubernetes Secret |
 | `frontend.enabled` | `true` | Deploy the frontend |
@@ -881,7 +852,7 @@ The full list of configurable values with their defaults:
 make test
 ```
 
-Expected output: **55 tests pass**.
+Expected output: **59 tests pass**.
 
 To also see code coverage:
 
@@ -893,15 +864,29 @@ make test-cov
 
 ## Authentication Reference
 
-### MCP Server & Agents — Azure credential chain
+### SSO Portal — Authentication flow
 
-| Priority | Method | When used |
-|----------|--------|-----------|
-| 1 | Service Principal (`ClientSecretCredential`) | `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` + `AZURE_TENANT_ID` set |
-| 2 | Azure CLI (`AzureCliCredential`) | User has run `az login` |
-| 3 | Managed Identity (`ManagedIdentityCredential`) | Running inside Azure (AKS pod) |
+The React frontend uses **MSAL PKCE redirect flow**. After login the FastAPI backend:
 
-Required Azure RBAC roles for the identity used:
+1. Validates the JWT signature using the tenant's JWKS (cached 1 h).
+2. Confirms the audience matches `AZURE_AD_APP_CLIENT_ID`.
+3. **No group check** — any successfully authenticated Azure AD user is allowed.
+
+The backend then performs an **On-Behalf-Of (OBO)** token exchange:
+
+4. Exchanges the user's app token for an Azure Resource Manager token.
+5. Injects the ARM token into the MCP server subprocess.
+6. All Azure SDK calls run as the signed-in user — Azure RBAC determines what is returned.
+
+### Azure credential chain in the MCP server
+
+| Priority | Credential | When used |
+|----------|-----------|-----------|
+| 1 | `StaticTokenCredential` (OBO ARM token) | `AZURE_ARM_TOKEN` set (per-request, injected by API) |
+| 2 | `AzureCliCredential` | Local dev fallback: user has run `az login` |
+| 3 | `ManagedIdentityCredential` | AKS pod with Workload Identity (no OBO configured) |
+
+Required Azure RBAC roles on the **user's identity** (or their AD groups):
 - `Reader` on the subscription or resource group
 - `Monitoring Reader` on the subscription (for Azure Monitor metrics)
 
@@ -910,7 +895,7 @@ Required Azure RBAC roles for the identity used:
 | Priority | Method | When used |
 |----------|--------|-----------|
 | 1 | API key (`AzureKeyCredential`) | `AZURE_FOUNDRY_API_KEY` is set |
-| 2 | Azure AD credential chain (above) | Key not set |
+| 2 | Server-level Azure AD credential | Key not set (OBO does not apply here) |
 
 ### Kubernetes
 
@@ -919,15 +904,7 @@ Required Azure RBAC roles for the identity used:
 | 1 | In-cluster ServiceAccount | `KUBERNETES_SERVICE_HOST` set or `K8S_IN_CLUSTER=true` |
 | 2 | Kubeconfig | `KUBECONFIG` env or `~/.kube/config` |
 
-### SSO Portal — Azure AD group enforcement
-
-The React frontend uses **MSAL PKCE redirect flow**. After login the FastAPI backend:
-
-1. Validates the JWT signature using the tenant's JWKS (cached 1 h).
-2. Checks the `groups` claim for the required AD security group OID.
-3. Falls back to **Microsoft Graph `transitiveMemberOf`** if the user is in >200 groups.
-
-Every API request must carry a valid bearer token. Users not in the group receive HTTP 403.
+Kubernetes tools always use the server's own ServiceAccount — they are not subject to OBO.
 
 ---
 
@@ -971,7 +948,7 @@ kubectl create clusterrolebinding aks-health-mcp-reader \
 | Credential isolation | Credentials loaded from env only; tool arguments never accept secrets |
 | Secret masking | `pydantic.SecretStr` + structlog `_scrub_sensitive` processor on all log output |
 | Audit logging | Every tool call and HTTP request logged with tool name, UPN, OID (no secret values) |
-| AD group enforcement | Backend validates `groups` JWT claim + MS Graph fallback; frontend alone is not trusted |
+| Azure RBAC enforcement | OBO flow: Azure API calls run as the user; Azure evaluates role assignments at query time |
 | CORS | Single configured origin; no wildcards |
 | Token validation | RS256 + JWKS cache (1 h TTL); audience accepts `<clientId>` and `api://<clientId>` |
 | Rate limiting | Tenacity exponential back-off on all Azure API calls |
@@ -995,9 +972,16 @@ You have no credentials configured. Either:
 
 Run `az aks get-credentials --resource-group <rg> --name <cluster>` to download the kubeconfig. Verify with `kubectl get nodes`.
 
-### Frontend shows "Access Denied"
+### Agent returns empty results or "403 Forbidden" from Azure tools
 
-The signed-in Azure AD account is not a member of the group specified in `AZURE_AD_ALLOWED_GROUP`. Add the user to the group in the Azure Portal (see [Step 5](#5-create-or-find-an-ad-security-group)).
+The signed-in user's Azure identity does not have Azure RBAC access to the subscription. Assign the `Reader` and `Monitoring Reader` roles to the user (or their AD group) on the subscription — see [Step 4](#4-assign-azure-rbac-roles-to-users).
+
+### OBO token exchange fails ("AADSTS…" error in backend logs)
+
+Common causes:
+- `AZURE_CLIENT_SECRET` is wrong or expired. Create a new secret on the app registration (Step 3b) and update `.env`.
+- The app registration does not have **Azure Service Management → user_impersonation** delegated permission granted. Go to API permissions and grant admin consent (Step 3c).
+- The user's token audience does not match the backend. Ensure the frontend requests `api://<AZURE_AD_APP_CLIENT_ID>/user_impersonation` scope.
 
 ### `Missing VITE_AZURE_AD_TENANT_ID or VITE_AZURE_AD_CLIENT_ID`
 
@@ -1023,7 +1007,7 @@ The request is missing an `Authorization: Bearer <token>` header. Every API call
 
 `FRONTEND_ORIGIN` in `.env` does not match the URL your browser is using. For local development it must be exactly `http://localhost:5173` (no trailing slash).
 
-### Helm: `backend.config.azureTenantId is required`
+### Helm: `backend.config.azureTenantId is required` (or similar)
 
 You installed the chart without setting the required values. Make sure your `my-values.yaml` sets all fields marked **Required** in the [Helm Values Reference](#helm-values-reference), or pass them with `--set`:
 

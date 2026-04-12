@@ -15,11 +15,9 @@ async def get_me(user: AuthenticatedUser = Depends(get_current_user)) -> dict:
     """
     Return the authenticated user's profile.
 
-    The frontend calls this immediately after login to confirm:
-      - The token is valid.
-      - The user belongs to the required AD group.
-    A 403 here means the user logged in successfully but is not
-    in the authorised group.
+    The frontend calls this immediately after login to confirm the token is
+    valid.  Any authenticated Azure AD user receives HTTP 200 here.
+    Resource-level access is controlled by Azure RBAC at query time.
     """
     return {
         "oid": user.oid,

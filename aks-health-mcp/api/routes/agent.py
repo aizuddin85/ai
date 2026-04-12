@@ -16,6 +16,13 @@ Event types:
 The frontend listens for 'result' to render the markdown report.
 'status' events are shown as progress messages while the agent works.
 'error' events surface agent/tool failures without killing the stream.
+
+Authorization
+-------------
+The signed-in user's Azure AD token is exchanged for an Azure Resource
+Manager token via the On-Behalf-Of (OBO) flow.  All Azure SDK calls inside
+the MCP server then run as the user, so Azure RBAC determines which
+subscriptions and resources are returned.
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ from pydantic import BaseModel, Field
 
 from agents.root_agent import RootAgent
 from api.auth.azure_ad import AuthenticatedUser, get_current_user
+from api.config import ApiSettings, get_api_settings
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +58,40 @@ class QueryRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# OBO token exchange
+# ---------------------------------------------------------------------------
+
+
+def _exchange_obo_token(user_token: str, settings: ApiSettings) -> str | None:
+    """
+    Exchange the user's Azure AD access token for an Azure Resource Manager
+    token using the On-Behalf-Of (OBO) flow.
+
+    Returns the ARM access token string, or None if OBO is not configured
+    (i.e. AZURE_CLIENT_SECRET is absent — fallback to server-level credential).
+    """
+    client_secret = settings.azure_client_secret
+    if not client_secret:
+        return None
+
+    try:
+        from azure.identity import OnBehalfOfCredential
+
+        obo_cred = OnBehalfOfCredential(
+            tenant_id=settings.azure_tenant_id,
+            client_id=settings.azure_ad_app_client_id,
+            client_secret=client_secret.get_secret_value(),
+            user_assertion=user_token,
+        )
+        token_obj = obo_cred.get_token("https://management.azure.com/.default")
+        logger.info("obo.exchange.success")
+        return token_obj.token
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("obo.exchange.failed", error=str(exc))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
 
@@ -63,9 +105,14 @@ async def _run_agent_stream(
     query: str,
     query_id: str,
     user: AuthenticatedUser,
+    settings: ApiSettings,
 ) -> AsyncGenerator[str, None]:
     """
     Drive the RootAgent and emit SSE events.
+
+    Performs an OBO exchange to obtain an ARM token scoped to the signed-in
+    user, then passes it through to the MCP server so all Azure SDK calls
+    run under the user's identity and RBAC.
 
     Yields:
         SSE-formatted strings to be sent to the browser.
@@ -91,8 +138,13 @@ async def _run_agent_stream(
                 "message": "Querying Azure and cluster health (this may take 15–30 s)…",
             })
 
+            # Exchange user token for ARM token (OBO).  Falls back to
+            # server-level credential (Workload Identity / az login) when
+            # AZURE_CLIENT_SECRET is not configured.
+            arm_token = _exchange_obo_token(user.access_token, settings)
+
             agent = RootAgent()
-            result = await agent.run(query)
+            result = await agent.run(query, arm_token=arm_token)
 
             log.info("agent.query.done", result_length=len(result))
             yield _sse({"type": "result", "query_id": query_id, "content": result})
@@ -132,6 +184,7 @@ async def _heartbeat(query_id: str) -> None:
 async def query_agent(
     body: QueryRequest,
     user: AuthenticatedUser = Depends(get_current_user),
+    settings: ApiSettings = Depends(get_api_settings),
 ) -> StreamingResponse:
     """
     Submit an AKS health query to the RootAgent.
@@ -139,8 +192,8 @@ async def query_agent(
     Returns a Server-Sent Events stream.  The browser should open this
     with EventSource or fetch() + ReadableStream.
 
-    All calls are authenticated and group-authorised via the bearer token
-    in the Authorization header.
+    All calls require a valid Azure AD bearer token.  Azure RBAC on the
+    caller's identity determines which resources are returned.
     """
     query_id = str(uuid.uuid4())
     logger.info(
@@ -151,7 +204,7 @@ async def query_agent(
     )
 
     return StreamingResponse(
-        _run_agent_stream(body.query, query_id, user),
+        _run_agent_stream(body.query, query_id, user, settings),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

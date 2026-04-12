@@ -179,18 +179,21 @@ class RootAgent:
             credential = get_azure_credential()
         return ChatCompletionsClient(endpoint=endpoint, credential=credential)
 
-    async def run(self, query: str) -> str:
+    async def run(self, query: str, arm_token: str | None = None) -> str:
         """
         Process a high-level AKS health query and return a synthesised
         Markdown report.
 
         Args:
-            query: Natural-language health question.
+            query:     Natural-language health question.
+            arm_token: Optional OBO ARM token to propagate to sub-agents so
+                       Azure SDK calls execute as the signed-in user.
 
         Returns:
             Formatted Markdown health report.
         """
         self._log.info("root_agent.run.start", query=query[:200])
+        self._arm_token = arm_token
         messages: list[Any] = [
             SystemMessage(content=_SYSTEM_PROMPT),
             UserMessage(content=query),
@@ -271,10 +274,12 @@ class RootAgent:
         sub_query: str = args.get("query", "")
         self._log.info("root_agent.sub_agent.call", tool=tool_name, query=sub_query[:100])
 
+        arm_token = getattr(self, "_arm_token", None)
+
         if tool_name == "query_azure_health":
-            return await self._azure_agent.run(sub_query)
+            return await self._azure_agent.run(sub_query, arm_token=arm_token)
         elif tool_name == "query_cluster_health":
-            return await self._cluster_agent.run(sub_query)
+            return await self._cluster_agent.run(sub_query, arm_token=arm_token)
         else:
             return json.dumps({"error": f"Unknown sub-agent tool: {tool_name}"})
 

@@ -9,10 +9,13 @@
  * Required API permissions (delegated):
  *   - openid, profile, email  (Microsoft Graph – sign-in)
  *   - api://<backend-client-id>/user_impersonation  (backend API)
- *   - GroupMember.Read.All (if group claim fallback via Graph is needed)
+ *   - Azure Service Management: user_impersonation  (for OBO → ARM)
  *
- * Token configuration:
- *   - App registration → Token configuration → Add groups claim → Security groups
+ * Authorization model:
+ *   Any authenticated Azure AD user can log in.  Resource access is gated
+ *   by the user's Azure RBAC role assignments — if they lack Reader on a
+ *   subscription, those resources are not returned.  No AD group
+ *   configuration is required.
  */
 
 import {

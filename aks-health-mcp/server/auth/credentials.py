@@ -2,31 +2,37 @@
 Azure and Kubernetes credential factories.
 
 Azure credential chain (highest-priority first):
-  1. Service Principal  – when AZURE_CLIENT_ID + AZURE_CLIENT_SECRET are set
-                          (robotic/CI use-case)
-  2. Azure CLI          – when the user has run `az login`
-                          (interactive/developer use-case)
-  3. Managed Identity   – when running inside an Azure-hosted workload
-                          (in-cluster pod with workload identity)
+  1. OBO ARM token  – when AZURE_ARM_TOKEN is set (per-request, user's identity)
+                      This token is injected by the API layer after an OBO exchange
+                      so all Azure SDK calls run under the signed-in user's identity,
+                      inheriting their Azure RBAC role assignments.
+  2. Azure CLI      – when the user has run `az login`
+                      (interactive/developer use-case; no AZURE_ARM_TOKEN)
+  3. Managed Identity – when running inside an Azure-hosted workload
+                        (in-cluster pod with Workload Identity)
+
+Note: the AZURE_ARM_TOKEN path is not cached with lru_cache because the
+token changes on every request.  The fallback chain (CLI / MI) IS cached.
 
 Kubernetes credential:
   1. In-cluster ServiceAccount token
   2. Kubeconfig file (with optional context override)
 
-All credential objects are cached as singletons for the process lifetime
-so we don't re-authenticate on every tool call.
+Kubernetes always uses the server's own service account — it is not
+subject to the OBO flow.
 """
 from __future__ import annotations
 
 import os
+import time
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
+from azure.core.credentials import AccessToken
 from azure.identity import (
     AzureCliCredential,
     ChainedTokenCredential,
-    ClientSecretCredential,
     ManagedIdentityCredential,
 )
 
@@ -36,47 +42,68 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Static token credential (wraps a pre-obtained access token)
+# ---------------------------------------------------------------------------
+
+
+class StaticTokenCredential:
+    """
+    Wraps a pre-obtained Azure access token as a TokenCredential.
+
+    Used to inject the OBO-exchanged ARM token into the MCP server so all
+    Azure SDK calls run under the signed-in user's identity.
+
+    The token expiry is set conservatively to 1 hour from construction; the
+    actual expiry is embedded in the JWT and enforced by Azure.
+    """
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+        self._expires_on = int(time.time()) + 3600
+
+    def get_token(self, *scopes: str, **kwargs: Any) -> AccessToken:  # noqa: ARG002
+        return AccessToken(self._token, self._expires_on)
+
+
+# ---------------------------------------------------------------------------
+# Azure credential factory
+# ---------------------------------------------------------------------------
+
+
+def get_azure_credential() -> "TokenCredential":
+    """
+    Return the appropriate Azure credential for this process invocation.
+
+    When AZURE_ARM_TOKEN is set (injected by the API layer from an OBO
+    exchange), a StaticTokenCredential is returned immediately — no caching,
+    because the token is user-scoped and changes per request.
+
+    Otherwise the cached fallback chain (AzureCliCredential →
+    ManagedIdentityCredential) is returned.
+    """
+    arm_token = os.getenv("AZURE_ARM_TOKEN", "").strip()
+    if arm_token:
+        logger.info("azure.auth.mode", mode="obo_user_token")
+        return StaticTokenCredential(arm_token)
+
+    return _get_cached_credential()
+
+
 @lru_cache(maxsize=1)
-def get_azure_credential() -> TokenCredential:
+def _get_cached_credential() -> "TokenCredential":
     """
-    Build the Azure credential chain.
+    Build and cache the server-level Azure credential chain.
 
-    The function is intentionally free of Settings import to avoid a
-    circular dependency; it reads env vars directly so it can be called
-    before Settings initialisation if needed.
+    Used when no per-request OBO token is available:
+      - Local development: AzureCliCredential (after `az login`)
+      - Production / AKS pod: ManagedIdentityCredential (Workload Identity)
     """
-    client_id = os.getenv("AZURE_CLIENT_ID", "").strip()
-    client_secret = os.getenv("AZURE_CLIENT_SECRET", "").strip()
-    tenant_id = os.getenv("AZURE_TENANT_ID", "").strip()
-
-    credentials: list[TokenCredential] = []
-
-    if client_id and client_secret and tenant_id:
-        logger.info(
-            "azure.auth.mode",
-            mode="service_principal",
-            client_id=client_id,
-            tenant_id=tenant_id,
-        )
-        credentials.append(
-            ClientSecretCredential(
-                tenant_id=tenant_id,
-                client_id=client_id,
-                client_secret=client_secret,
-            )
-        )
-    else:
-        logger.info("azure.auth.mode", mode="user_or_managed_identity")
-
-    # Always add CLI and MI as fallbacks
-    credentials.extend(
-        [
-            AzureCliCredential(),
-            ManagedIdentityCredential(),
-        ]
+    logger.info("azure.auth.mode", mode="cli_or_managed_identity")
+    return ChainedTokenCredential(
+        AzureCliCredential(),
+        ManagedIdentityCredential(),
     )
-
-    return ChainedTokenCredential(*credentials)
 
 
 def get_kubernetes_client() -> tuple[object, object]:

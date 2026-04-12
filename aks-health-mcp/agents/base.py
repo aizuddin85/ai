@@ -81,15 +81,22 @@ class BaseMcpAgent:
     # Public interface
     # ------------------------------------------------------------------
 
-    async def run(self, query: str) -> str:
+    async def run(self, query: str, arm_token: str | None = None) -> str:
         """
         Process a user query end-to-end and return the final text answer.
 
         Opens an MCP session, builds the tool list, runs the conversation
         loop, and closes the session before returning.
+
+        Args:
+            query:     Natural-language health question.
+            arm_token: Optional Azure Resource Manager access token obtained
+                       via OBO exchange.  When provided it is injected into
+                       the MCP server subprocess as AZURE_ARM_TOKEN so all
+                       Azure SDK calls run under the user's identity.
         """
         self._log.info("agent.run.start", query=query[:200])
-        server_env = self._build_server_env()
+        server_env = self._build_server_env(arm_token=arm_token)
 
         server_params = StdioServerParameters(
             command=_SERVER_CMD[0],
@@ -131,14 +138,23 @@ class BaseMcpAgent:
 
         return ChatCompletionsClient(endpoint=endpoint, credential=credential)
 
-    def _build_server_env(self) -> dict[str, str]:
+    def _build_server_env(self, arm_token: str | None = None) -> dict[str, str]:
         """
         Build the environment for the MCP server child process.
-        Always sets stdio transport; injects PYTHONPATH for imports.
+
+        Always sets stdio transport and injects PYTHONPATH for imports.
+        When arm_token is provided it is passed as AZURE_ARM_TOKEN so the
+        MCP server uses the user's OBO credential instead of a server-level
+        service principal or managed identity.
         """
         env = dict(os.environ)
         env["MCP_TRANSPORT"] = "stdio"
         env["PYTHONPATH"] = str(_REPO_ROOT)
+        if arm_token:
+            env["AZURE_ARM_TOKEN"] = arm_token
+        elif "AZURE_ARM_TOKEN" in env:
+            # Don't leak a stale token from a previous invocation
+            del env["AZURE_ARM_TOKEN"]
         return env
 
     async def _discover_tools(

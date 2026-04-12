@@ -2,11 +2,13 @@
  * useGroupAuth
  *
  * After MSAL completes authentication, acquires an API-scoped token and
- * calls GET /api/auth/me to verify:
- *   1. The token is valid.
- *   2. The user is a member of the required AD group.
+ * calls GET /api/auth/me to confirm the token is valid with the backend.
  *
- * Returns the user profile or an error / loading state.
+ * Any authenticated Azure AD user is authorized — no AD group check is
+ * performed.  Resource access is controlled by the user's Azure RBAC role
+ * assignments evaluated at query time.
+ *
+ * Returns the user profile or a loading / error state.
  */
 import { useEffect, useState } from 'react'
 
@@ -20,7 +22,6 @@ import type { UserProfile } from '@/types'
 export type GroupAuthState =
   | { status: 'loading' }
   | { status: 'authorized'; user: UserProfile }
-  | { status: 'unauthorized'; reason: string }
   | { status: 'error'; error: Error }
 
 export function useGroupAuth(): GroupAuthState {
@@ -53,21 +54,12 @@ export function useGroupAuth(): GroupAuthState {
       } catch (err) {
         if (cancelled) return
 
-        if (err instanceof ApiError) {
-          if (err.isForbidden) {
-            setState({
-              status: 'unauthorized',
-              reason: err.message,
-            })
-            return
-          }
-          if (err.isUnauthorized) {
-            // Token expired or revoked – trigger interactive re-auth
-            try {
-              await instance.acquireTokenRedirect({ ...apiTokenRequest, account })
-            } catch { /* redirect will handle this */ }
-            return
-          }
+        if (err instanceof ApiError && err.isUnauthorized) {
+          // Token expired or revoked – trigger interactive re-auth
+          try {
+            await instance.acquireTokenRedirect({ ...apiTokenRequest, account })
+          } catch { /* redirect will handle this */ }
+          return
         }
 
         // Consent required or no cached token → interactive login

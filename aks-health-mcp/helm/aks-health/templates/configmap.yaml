@@ -16,7 +16,6 @@ data:
 
   # Azure AD SSO
   AZURE_AD_APP_CLIENT_ID:   {{ required "backend.config.azureAdAppClientId is required" .Values.backend.config.azureAdAppClientId | quote }}
-  AZURE_AD_ALLOWED_GROUP:   {{ required "backend.config.azureAdAllowedGroup is required" .Values.backend.config.azureAdAllowedGroup | quote }}
   FRONTEND_ORIGIN:          {{ required "backend.config.frontendOrigin is required" .Values.backend.config.frontendOrigin | quote }}
 
   # MCP / transport
