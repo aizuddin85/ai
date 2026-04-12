@@ -153,6 +153,7 @@ async def test_execute_tool_returns_text_content() -> None:
     """_execute_tool should return the tool result text."""
     agent = AzureHealthAgent.__new__(AzureHealthAgent)
     agent.tool_prefix = "aks_"
+    agent.tool_results = []
     from server.logging_config import get_logger
     agent._log = get_logger("test")
 
@@ -173,6 +174,7 @@ async def test_execute_tool_handles_exception() -> None:
     """_execute_tool should return error JSON on exception."""
     agent = AzureHealthAgent.__new__(AzureHealthAgent)
     agent.tool_prefix = "aks_"
+    agent.tool_results = []
     from server.logging_config import get_logger
     agent._log = get_logger("test")
 

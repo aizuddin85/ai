@@ -76,6 +76,8 @@ class BaseMcpAgent:
         self._settings = get_settings()
         self._foundry_client = self._build_foundry_client()
         self._log = get_logger(f"agent.{self.name}")
+        # Populated during run(); read by root_agent for hallucination review
+        self.tool_results: list[str] = []
 
     # ------------------------------------------------------------------
     # Public interface
@@ -96,6 +98,8 @@ class BaseMcpAgent:
                        Azure SDK calls run under the user's identity.
         """
         self._log.info("agent.run.start", query=query[:200])
+        # Reset tool results for this invocation
+        self.tool_results = []
         server_env = self._build_server_env(arm_token=arm_token)
 
         server_params = StdioServerParameters(
@@ -267,7 +271,7 @@ class BaseMcpAgent:
     async def _execute_tool(
         self, session: ClientSession, tool_name: str, tool_input: dict[str, Any]
     ) -> str:
-        """Call an MCP tool and return the result as a string."""
+        """Call an MCP tool, record the result for hallucination review, and return it."""
         self._log.info("agent.tool.call", tool=tool_name)
         try:
             result = await session.call_tool(tool_name, arguments=tool_input)
@@ -277,7 +281,11 @@ class BaseMcpAgent:
                     parts.append(item.text)
                 else:
                     parts.append(str(item))
-            return "\n".join(parts)
+            content = "\n".join(parts)
         except Exception as exc:  # noqa: BLE001
             self._log.warning("agent.tool.error", tool=tool_name, error=str(exc))
-            return json.dumps({"error": f"Tool execution failed: {exc}"})
+            content = json.dumps({"error": f"Tool execution failed: {exc}"})
+
+        # Collect raw tool output for downstream hallucination review
+        self.tool_results.append(f"=== Tool: {tool_name} ===\n{content}")
+        return content

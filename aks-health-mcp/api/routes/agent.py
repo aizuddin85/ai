@@ -36,6 +36,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from agents.firewall import check_query
 from agents.root_agent import RootAgent
 from api.auth.azure_ad import AuthenticatedUser, get_current_user
 from api.config import ApiSettings, get_api_settings
@@ -132,6 +133,27 @@ async def _run_agent_stream(
         # reachable in the finally clause and can be properly cancelled.
         heartbeat_task = asyncio.create_task(_heartbeat(query_id))
         try:
+            # ── AI Firewall ───────────────────────────────────────────────
+            # Validate the query before any expensive work.
+            yield _sse({
+                "type": "status",
+                "query_id": query_id,
+                "message": "Validating query…",
+            })
+            firewall = await check_query(query, settings)
+            if not firewall.allowed:
+                log.warning(
+                    "agent.query.blocked",
+                    reason=firewall.reason,
+                    check=firewall.check,
+                )
+                yield _sse({
+                    "type": "error",
+                    "query_id": query_id,
+                    "message": f"Query not allowed: {firewall.reason}",
+                })
+                return
+
             yield _sse({
                 "type": "status",
                 "query_id": query_id,
