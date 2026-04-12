@@ -1,10 +1,18 @@
 """
 Cluster Health Task Agent
 =========================
-Specialised agent with access to in-cluster Kubernetes tools only
-(k8s_* prefix).  It answers questions about live workload health:
-nodes, pods, deployments, DaemonSets, StatefulSets, events, PVCs, and
-control-plane component status.
+Specialised agent with access to in-cluster Kubernetes tools only.
+Targets the tool set exposed by the official Microsoft AKS MCP server
+(github.com/Azure/aks-mcp) that covers workload-level operations:
+
+  call_kubectl                   – raw kubectl queries
+  call_helm / call_cilium /
+  call_hubble                    – Helm, Cilium, Hubble CLI
+  collect_aks_node_logs          – kubelet, containerd, kernel, syslog
+  inspektor_gadget_observability – eBPF-based DNS/TCP/process tracing
+
+It answers questions about live workload health: nodes, pods, deployments,
+DaemonSets, StatefulSets, events, PVCs, and control-plane component status.
 """
 from __future__ import annotations
 
@@ -23,6 +31,8 @@ Your responsibilities:
   Unhealthy, OOMKilling).
 - Report on unbound PVCs and service configuration issues.
 - Summarise control-plane component health.
+- Collect node-level system logs (kubelet, containerd, kernel) when needed
+  for deeper diagnosis.
 
 Constraints:
 - You ONLY have access to in-cluster Kubernetes API data; you cannot see
@@ -46,4 +56,11 @@ class ClusterHealthAgent(BaseMcpAgent):
 
     name = "cluster-health"
     system_prompt = _SYSTEM_PROMPT
-    tool_prefix = "k8s_"
+    # Matches tools from the official aks-mcp binary:
+    #   call_kubectl                   – kubectl queries
+    #   call_helm, call_cilium,
+    #   call_hubble                    – ecosystem CLIs (start with "call_")
+    #   collect_aks_node_logs          – node log collection
+    #   inspektor_gadget_observability – eBPF observability
+    tool_prefixes = ("call_kubectl", "call_helm", "call_cilium", "call_hubble",
+                     "collect_", "inspektor_")

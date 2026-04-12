@@ -2,7 +2,8 @@
 Base agent class — powered by Azure AI Foundry.
 
 Each agent:
-  1. Launches the MCP server as a child process (stdio transport).
+  1. Launches the official Microsoft AKS MCP server binary (github.com/Azure/aks-mcp)
+     as a child process using stdio transport.
   2. Connects to it via the MCP client SDK.
   3. Discovers available tools and converts them to the Azure AI Foundry
      ChatCompletionsToolDefinition format.
@@ -12,18 +13,17 @@ Each agent:
   5. Tears down the MCP connection and server process cleanly on exit.
 
 Authentication for the Foundry client follows the same pattern as the
-MCP server's Azure credential chain:
+Azure credential chain:
   - If AZURE_FOUNDRY_API_KEY is set → AzureKeyCredential (key auth)
   - Otherwise → the Azure AD ChainedTokenCredential (SP or user login)
 
 The base class is tool-agnostic; subclasses narrow the visible tool set
-via tool_prefix so each agent stays focused on its domain.
+via tool_prefixes so each agent stays focused on its domain.
 """
 from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,6 @@ import structlog
 from azure.ai.inference import ChatCompletionsClient
 from azure.ai.inference.models import (
     AssistantMessage,
-    ChatCompletionsToolCall,
     ChatCompletionsToolDefinition,
     CompletionsFinishReason,
     FunctionDefinition,
@@ -50,27 +49,38 @@ from server.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Server launch command (always stdio when spawned by an agent)
-_SERVER_CMD = [sys.executable, "-m", "server.main"]
 _REPO_ROOT = Path(__file__).parent.parent
+
+# Environment variables to strip before passing the process environment to the
+# aks-mcp child process.  The binary only needs Azure SDK credential vars
+# (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, etc.) and standard
+# system vars (PATH, HOME, KUBECONFIG …).  Foundry-specific secrets are
+# application-layer secrets that the binary has no use for.
+_CHILD_ENV_EXCLUDE: frozenset[str] = frozenset({
+    "AZURE_FOUNDRY_API_KEY",   # Foundry auth secret – not needed by aks-mcp
+    "AZURE_FOUNDRY_ENDPOINT",  # Foundry inference URL – not needed by aks-mcp
+    "AZURE_FOUNDRY_MODEL",     # Foundry model name – not needed by aks-mcp
+    "AZURE_ARM_TOKEN",         # Deprecated OBO token field – not used by aks-mcp
+})
 
 
 class BaseMcpAgent:
     """
-    Base class for agents that call the AKS Health MCP server using
-    Azure AI Foundry as the LLM provider.
+    Base class for agents that call the official Microsoft AKS MCP server
+    (github.com/Azure/aks-mcp) using Azure AI Foundry as the LLM provider.
 
     Subclasses should set:
-      name        : human-readable agent name (used in logging).
-      system_prompt: Foundry system message scoping the agent's role.
-      tool_prefix  : Only MCP tools whose names start with this prefix are
-                     exposed to the model. Empty string → all tools.
-                     E.g. "aks_" for Azure-only, "k8s_" for cluster-only.
+      name          : human-readable agent name (used in logging).
+      system_prompt : Foundry system message scoping the agent's role.
+      tool_prefixes : Tuple of name prefixes; only MCP tools whose names
+                      start with one of these are exposed to the model.
+                      Empty tuple → all tools are exposed.
+                      E.g. ("az_", "aks_") for Azure-only tools.
     """
 
     name: str = "base"
     system_prompt: str = "You are a helpful AKS health assistant."
-    tool_prefix: str = ""
+    tool_prefixes: tuple[str, ...] = ()
 
     def __init__(self) -> None:
         self._settings = get_settings()
@@ -87,24 +97,34 @@ class BaseMcpAgent:
         """
         Process a user query end-to-end and return the final text answer.
 
-        Opens an MCP session, builds the tool list, runs the conversation
-        loop, and closes the session before returning.
+        Opens an MCP session against the official aks-mcp binary, builds
+        the tool list, runs the conversation loop, and closes the session
+        before returning.
 
         Args:
             query:     Natural-language health question.
-            arm_token: Optional Azure Resource Manager access token obtained
-                       via OBO exchange.  When provided it is injected into
-                       the MCP server subprocess as AZURE_ARM_TOKEN so all
-                       Azure SDK calls run under the user's identity.
+            arm_token: Retained for API-layer compatibility only.  The
+                       official aks-mcp binary authenticates via the
+                       standard Azure SDK credential chain (Service
+                       Principal env vars / Workload Identity / az login)
+                       and does not accept per-request token injection.
+                       This parameter has no effect on the binary's auth.
         """
         self._log.info("agent.run.start", query=query[:200])
         # Reset tool results for this invocation
         self.tool_results = []
-        server_env = self._build_server_env(arm_token=arm_token)
+
+        settings = self._settings
+        server_cmd = [
+            settings.aks_mcp_binary,
+            "--transport", "stdio",
+            "--access-level", settings.aks_mcp_access_level,
+        ]
+        server_env = self._build_server_env()
 
         server_params = StdioServerParameters(
-            command=_SERVER_CMD[0],
-            args=_SERVER_CMD[1:],
+            command=server_cmd[0],
+            args=server_cmd[1:],
             env=server_env,
             cwd=str(_REPO_ROOT),
         )
@@ -142,24 +162,20 @@ class BaseMcpAgent:
 
         return ChatCompletionsClient(endpoint=endpoint, credential=credential)
 
-    def _build_server_env(self, arm_token: str | None = None) -> dict[str, str]:
+    def _build_server_env(self) -> dict[str, str]:
         """
-        Build the environment for the MCP server child process.
+        Build the environment for the aks-mcp child process.
 
-        Always sets stdio transport and injects PYTHONPATH for imports.
-        When arm_token is provided it is passed as AZURE_ARM_TOKEN so the
-        MCP server uses the user's OBO credential instead of a server-level
-        service principal or managed identity.
+        Passes through Azure credential env vars (AZURE_TENANT_ID,
+        AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_FEDERATED_TOKEN_FILE,
+        PATH, HOME, KUBECONFIG, etc.) so the binary can authenticate via
+        the standard Azure SDK credential chain.
+
+        Foundry-specific secrets and the deprecated AZURE_ARM_TOKEN are
+        excluded — they are not needed by the binary and should not be
+        accessible to a sub-process beyond this application layer.
         """
-        env = dict(os.environ)
-        env["MCP_TRANSPORT"] = "stdio"
-        env["PYTHONPATH"] = str(_REPO_ROOT)
-        if arm_token:
-            env["AZURE_ARM_TOKEN"] = arm_token
-        elif "AZURE_ARM_TOKEN" in env:
-            # Don't leak a stale token from a previous invocation
-            del env["AZURE_ARM_TOKEN"]
-        return env
+        return {k: v for k, v in os.environ.items() if k not in _CHILD_ENV_EXCLUDE}
 
     async def _discover_tools(
         self, session: ClientSession
@@ -167,14 +183,16 @@ class BaseMcpAgent:
         """
         Fetch tools from the MCP server and convert them to the
         Azure AI Foundry ChatCompletionsToolDefinition format.
-        Applies self.tool_prefix filter.
+        Applies self.tool_prefixes filter when non-empty.
         """
         mcp_response = await session.list_tools()
         mcp_tools: list[McpTool] = mcp_response.tools
 
         foundry_tools: list[ChatCompletionsToolDefinition] = []
         for tool in mcp_tools:
-            if self.tool_prefix and not tool.name.startswith(self.tool_prefix):
+            if self.tool_prefixes and not any(
+                tool.name.startswith(p) for p in self.tool_prefixes
+            ):
                 continue
             foundry_tools.append(
                 ChatCompletionsToolDefinition(
@@ -190,7 +208,7 @@ class BaseMcpAgent:
             "agent.tools.discovered",
             total_mcp=len(mcp_tools),
             filtered=len(foundry_tools),
-            prefix=self.tool_prefix or "(all)",
+            prefixes=self.tool_prefixes or "(all)",
         )
         return foundry_tools
 

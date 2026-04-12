@@ -1,8 +1,10 @@
-# AKS Health MCP Server
+# AKS Health Dashboard
 
-Production-grade **Model Context Protocol (MCP) server** for monitoring Azure Kubernetes Service (AKS) health from both the **Azure control plane** and the **live in-cluster Kubernetes API**.
+AI-powered AKS health monitoring dashboard that combines the **official Microsoft AKS MCP server** ([Azure/aks-mcp](https://github.com/Azure/aks-mcp)) with a **multi-agent framework** powered by **Azure AI Foundry** and a **React sysadmin portal** with Azure AD SSO.
 
-Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **React sysadmin portal** with Azure AD SSO. Access to Azure resources is governed by each user's **Azure RBAC role assignments** — no hard-coded group configuration required.
+The official `aks-mcp` binary is the sole MCP server: it provides rich AKS + Kubernetes tooling (Azure CLI, kubectl, Cilium, Helm, eBPF observability) maintained by Microsoft. This project adds the AI orchestration layer on top: firewall, hallucination review, concurrent sub-agents, and an SSE-streaming portal.
+
+Access to Azure resources is governed by each user's **Azure RBAC role assignments** — no hard-coded group configuration required.
 
 ---
 
@@ -10,31 +12,32 @@ Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **Rea
 
 1. [Architecture](#architecture)
 2. [MCP Tools](#mcp-tools)
-3. [Prerequisites](#prerequisites)
-4. [Azure Setup](#azure-setup)
+3. [Session Isolation](#session-isolation)
+4. [Prerequisites](#prerequisites)
+5. [Azure Setup](#azure-setup)
    - [Find Your Tenant ID and Subscription ID](#1-find-your-tenant-id-and-subscription-id)
    - [Create an App Registration](#2-create-an-app-registration)
    - [Configure the App Registration](#3-configure-the-app-registration)
    - [Assign Azure RBAC Roles to Users](#4-assign-azure-rbac-roles-to-users)
    - [Set Up Azure AI Foundry](#5-set-up-azure-ai-foundry)
-5. [Installation](#installation)
-6. [Configuration](#configuration)
+6. [Installation](#installation)
+7. [Configuration](#configuration)
    - [Backend `.env`](#backend-env)
    - [Frontend `frontend/.env`](#frontend-frontendenv)
-7. [Running the Stack](#running-the-stack)
-8. [Kubernetes Deployment (Docker + Helm)](#kubernetes-deployment-docker--helm)
+8. [Running the Stack](#running-the-stack)
+9. [Kubernetes Deployment (Docker + Helm)](#kubernetes-deployment-docker--helm)
    - [Prerequisites for Kubernetes](#prerequisites-for-kubernetes)
    - [Build and Push Docker Images](#build-and-push-docker-images)
    - [Deploy with Helm](#deploy-with-helm)
    - [Azure Workload Identity (Recommended)](#azure-workload-identity-recommended)
    - [Service Principal Authentication](#service-principal-authentication)
    - [Helm Values Reference](#helm-values-reference)
-9. [Running Tests](#running-tests)
-10. [Authentication Reference](#authentication-reference)
-11. [Kubernetes RBAC](#kubernetes-rbac)
-12. [Security Controls](#security-controls)
-13. [Troubleshooting](#troubleshooting)
-14. [Project Structure](#project-structure)
+10. [Running Tests](#running-tests)
+11. [Authentication Reference](#authentication-reference)
+12. [Kubernetes RBAC](#kubernetes-rbac)
+13. [Security Controls](#security-controls)
+14. [Troubleshooting](#troubleshooting)
+15. [Project Structure](#project-structure)
 
 ---
 
@@ -45,11 +48,12 @@ Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **Rea
 │                     Sysadmin Browser                         │
 │              React + MSAL (Azure AD SSO / PKCE)              │
 └────────────────────────┬─────────────────────────────────────┘
-                         │  Bearer token
+                         │  Bearer token (Azure AD JWT)
                          ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                    FastAPI Backend                            │
+│                    FastAPI Backend  (Python)                  │
 │  JWT validation · OBO token exchange · SSE streaming         │
+│  Per-request asyncio task · structlog contextvars isolated   │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐     │
 │  │  AI Firewall  (fast regex + LLM classifier)         │     │
@@ -57,67 +61,161 @@ Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **Rea
 │  │          destructive ops · off-topic queries         │     │
 │  └─────────────────────────────────────────────────────┘     │
 └────────────────────────┬─────────────────────────────────────┘
-                         │
+                         │  per-request RootAgent instance
                          ▼
 ┌──────────────────────────────────────────────────────────────┐
 │               Root Agent  (Azure AI Foundry)                 │
 │   tools: query_azure_health  ·  query_cluster_health         │
 └───────────────┬──────────────────────────┬───────────────────┘
-                │  (concurrent)            │
+                │  (concurrent asyncio)    │
                 ▼                          ▼
   ┌─────────────────────┐    ┌──────────────────────┐
   │   AzureHealthAgent  │    │  ClusterHealthAgent  │
-  │   (aks_* tools)     │    │  (k8s_* tools)       │
+  │  az_* / aks_* tools │    │  call_kubectl / etc  │
   └──────────┬──────────┘    └──────────┬───────────┘
              │                          │
-             └────────────┬─────────────┘
-                          ▼
-          ┌───────────────────────────────┐
-          │    AKS Health MCP Server      │  ← Strict read-only
-          │   ┌───────────────────────┐   │
-          │   │  Azure AKS tools      │───┼──▶ Azure Resource Manager API
-          │   │  Kubernetes tools     │───┼──▶ Kubernetes API
-          │   └───────────────────────┘   │
-          └───────────────────────────────┘
-                          │
-                          ▼
-          ┌───────────────────────────────┐
-          │  Hallucination Reviewer       │
-          │  LLM cross-checks answer vs   │
-          │  raw tool data; corrects and  │
-          │  flags fabricated facts       │
-          └───────────────────────────────┘
+             └──────────┬───────────────┘
+                        │  stdio (fresh child process per agent run)
+                        ▼
+          ┌────────────────────────────────────┐
+          │  aks-mcp  (official Microsoft Go   │  ← --access-level readonly
+          │  binary · github.com/Azure/aks-mcp)│
+          │                                    │
+          │  az_aks_operations ─────────────── │──▶ Azure CLI  (az)
+          │  aks_monitoring ────────────────── │──▶ Azure Monitor / ARM
+          │  aks_network_resources ──────────  │──▶ Azure Networking API
+          │  aks_detector / advisor ─────────  │──▶ Azure Diagnostics
+          │  call_kubectl ──────────────────── │──▶ Kubernetes API
+          │  collect_aks_node_logs ──────────  │──▶ Node SSH / AKS API
+          │  inspektor_gadget_observability ── │──▶ eBPF (in-cluster)
+          │  call_helm / call_cilium ────────  │──▶ cluster tooling
+          └────────────────────────────────────┘
+                        │
+                        ▼
+          ┌──────────────────────────────────────┐
+          │  Hallucination Reviewer              │
+          │  LLM cross-checks answer vs raw data │
+          │  corrects fabricated facts; appends  │
+          │  transparency note when corrected    │
+          └──────────────────────────────────────┘
 ```
+
+### Key design decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Official `aks-mcp` binary as MCP server | Maintained by Microsoft; broader tool coverage; no custom Azure/k8s SDK code to maintain |
+| `--access-level readonly` enforced | Hard guard at the binary level — no write tools exposed regardless of agent instructions |
+| Fresh child process per agent invocation | Complete process isolation between requests; no shared in-memory state between users |
+| Semaphore limits 5 concurrent agent calls | Caps resource consumption (each invocation spawns 2 aks-mcp child processes) |
+| structlog `contextvars` (not thread-locals) | Per-asyncio-task log context; bound at request start, unbound in `finally`; zero cross-session leakage |
+| Foundry secrets excluded from child env | Principle of least privilege — aks-mcp only receives Azure SDK credential vars it actually needs |
 
 ---
 
 ## MCP Tools
 
-### Azure Control Plane — `aks_*`
+Tools are provided by the official **[Azure/aks-mcp](https://github.com/Azure/aks-mcp)** binary.  
+The backend runs the binary with `--access-level readonly`, which restricts it to read and diagnostic operations only.
+
+### Azure control-plane tools (exposed to `AzureHealthAgent`)
 
 | Tool | Description |
 |------|-------------|
-| `aks_list_clusters` | List AKS clusters in a subscription / resource group |
-| `aks_get_cluster_detail` | Full cluster config, network profile, OIDC settings |
-| `aks_get_node_pools` | Node pool VM sizes, autoscaling, provisioning state |
-| `aks_get_upgrade_profile` | Available Kubernetes upgrades (GA and preview) |
-| `aks_get_resource_health_events` | Azure Resource Health incidents and maintenance |
-| `aks_get_metrics` | Azure Monitor metrics (CPU, memory, pod counts) |
+| `az_aks_operations` | AKS cluster and node pool queries via Azure CLI |
+| `aks_network_resources` | VNets, subnets, NSGs, route tables, load balancers |
+| `aks_monitoring` | Azure Monitor metrics, Application Insights, diagnostic logs |
+| `aks_detector` | Azure Diagnostics detector reports |
+| `aks_advisor_recommendation` | Azure Advisor cost/reliability recommendations |
+| `az_fleet` | Azure Fleet multi-cluster management |
+| `az_compute_operations` | VM and VMSS management queries |
+| `get_aks_vmss_info` | VMSS configuration for node pools |
+| `call_az` | Raw Azure CLI fallback for ad-hoc queries |
 
-### In-Cluster Kubernetes — `k8s_*`
+### In-cluster / workload tools (exposed to `ClusterHealthAgent`)
 
 | Tool | Description |
 |------|-------------|
-| `k8s_get_nodes` | Node readiness, capacity, roles, kubelet version |
-| `k8s_get_pods` | Pod phase, container states, restart counts |
-| `k8s_get_deployments` | Deployment replica health |
-| `k8s_get_daemonsets` | DaemonSet scheduling status |
-| `k8s_get_statefulsets` | StatefulSet replica health |
-| `k8s_get_events` | Cluster events (Warning / Normal), sorted by recency |
-| `k8s_get_namespaces` | Namespace list and phases |
-| `k8s_get_pvc_status` | PVC binding status and storage class |
-| `k8s_get_services` | Service types, ports, load-balancer addresses |
-| `k8s_get_component_status` | Control-plane component health |
+| `call_kubectl` | Flexible kubectl queries (nodes, pods, events, deployments…) |
+| `collect_aks_node_logs` | Node system logs: kubelet, containerd, kernel, syslog |
+| `inspektor_gadget_observability` | eBPF-based DNS, TCP, file-ops, process tracing |
+| `call_helm` | Helm release and chart queries |
+| `call_cilium` | Cilium networking CLI |
+| `call_hubble` | Hubble network observability (Cilium) |
+
+> **Tool prefix routing:** `AzureHealthAgent` receives tools starting with `az_`, `aks_`, `get_aks_`, or `call_az`.  
+> `ClusterHealthAgent` receives tools starting with `call_kubectl`, `call_helm`, `call_cilium`, `call_hubble`, `collect_`, or `inspektor_`.  
+> Tools outside these prefixes (e.g. write operations enabled at higher access levels) are never exposed to the models.
+
+---
+
+## Session Isolation
+
+Every layer of the stack is designed so that one user's request cannot read, influence, or corrupt another user's request.
+
+### Request-level process isolation
+
+```
+Request A (user Alice)           Request B (user Bob)
+─────────────────────────        ─────────────────────────
+RootAgent() ← fresh instance     RootAgent() ← fresh instance
+  AzureHealthAgent()               AzureHealthAgent()
+    aks-mcp child PID 1234           aks-mcp child PID 5678  ← separate OS process
+  ClusterHealthAgent()             ClusterHealthAgent()
+    aks-mcp child PID 1235           aks-mcp child PID 5679  ← separate OS process
+```
+
+Each HTTP request creates a **new `RootAgent` instance** (and therefore new `AzureHealthAgent` / `ClusterHealthAgent` instances), so `tool_results` and conversation history never cross between requests.  
+Each agent invocation spawns a **fresh `aks-mcp` child process** via stdio transport. When the request ends, the process is terminated. No state persists between requests at the MCP layer.
+
+### Logging context isolation
+
+`structlog` uses Python's `contextvars` module for per-request log context. `contextvars.ContextVar` values are isolated to the asyncio task that set them — a value bound in one request's task is invisible to other tasks.
+
+```python
+# On entry to each agent SSE stream:
+structlog.contextvars.bind_contextvars(query_id=..., user_oid=...)
+# In the finally block, always cleaned up:
+structlog.contextvars.unbind_contextvars("query_id", "user_oid")
+```
+
+The HTTP middleware binds `request_id` before calling into the handler. The agent layer **does not call `clear_contextvars()`** (which would drop `request_id`) — it only adds and later removes its own keys.
+
+### Child-process environment filtering
+
+Before spawning an `aks-mcp` subprocess, the agent layer **strips application-layer secrets** that the binary does not need:
+
+| Excluded variable | Reason |
+|-------------------|--------|
+| `AZURE_FOUNDRY_API_KEY` | Foundry auth secret — no use to aks-mcp |
+| `AZURE_FOUNDRY_ENDPOINT` | Foundry URL — no use to aks-mcp |
+| `AZURE_FOUNDRY_MODEL` | Foundry model name — no use to aks-mcp |
+| `AZURE_ARM_TOKEN` | Deprecated OBO field — not supported by aks-mcp |
+
+All standard Azure SDK credential vars (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_FEDERATED_TOKEN_FILE`, etc.) are passed through so the binary can authenticate.
+
+### Concurrency cap
+
+```python
+_AGENT_SEMAPHORE = asyncio.Semaphore(5)
+```
+
+A module-level semaphore limits the process to **5 concurrent agent invocations**. Each invocation spawns up to 2 aks-mcp processes, so the cap prevents runaway resource consumption from concurrent requests.
+
+### Error message sanitisation
+
+Internal exception messages (stack traces, file paths, internal identifiers) are **not returned to the client**. The SSE stream sends a generic `"An unexpected error occurred"` message; full details are emitted to server logs only.
+
+### JWKS cache isolation
+
+Azure AD public key material is cached per-tenant, keyed by `tenant_id`. The cache is bounded to 10 tenants with a 1-hour TTL. Different tenant entries cannot interfere with each other.
+
+### What is NOT isolated (known limitations)
+
+| Item | Details |
+|------|---------|
+| **Azure credential** | All requests share the server's identity (Service Principal or Workload Identity). OBO token flow performs the token exchange in the API layer but the `aks-mcp` binary uses its own Azure SDK credential chain, not a per-request injected token. In practice this means Azure RBAC is enforced at the subscription/resource-group level on the server's managed identity, not per-user. |
+| **Foundry LLM calls** | All firewall, reviewer, and agent LLM calls use a single shared `ChatCompletionsClient` constructed at agent instantiation time. Token quotas are pooled across requests. |
 
 ---
 
@@ -131,6 +229,7 @@ Install the following before starting:
 | Node.js | 18 LTS | https://nodejs.org/en/download |
 | Azure CLI | 2.60 | https://learn.microsoft.com/en-us/cli/azure/install-azure-cli |
 | kubectl | 1.28 | https://kubernetes.io/docs/tasks/tools/ |
+| **aks-mcp** | latest | `make install-aks-mcp` (see [Installation](#installation)) |
 | git | any | https://git-scm.com/downloads |
 
 Verify everything is installed:
@@ -140,6 +239,7 @@ python --version      # Python 3.11+
 node --version        # v18+
 az --version          # azure-cli 2.60+
 kubectl version --client
+aks-mcp --version     # after running make install-aks-mcp
 ```
 
 You also need:
@@ -287,10 +387,16 @@ Azure AI Foundry hosts the LLM model that powers the health agents.
 git clone <repo-url>
 cd aks-health-mcp
 
-# 2. Install Python dependencies (backend + agents + API)
+# 2. Download the official Microsoft AKS MCP binary (Linux AMD64)
+make install-aks-mcp
+# Binary is saved to ./bin/aks-mcp and chmod +x'd automatically.
+# Override defaults if needed:
+#   make install-aks-mcp AKS_MCP_OS=darwin AKS_MCP_ARCH=arm64
+
+# 3. Install Python dependencies (backend + agents + API)
 pip install -e ".[dev,api]"
 
-# 3. Install frontend dependencies
+# 4. Install frontend dependencies
 cd frontend
 npm install
 cd ..
@@ -323,37 +429,26 @@ Open `.env` in a text editor. Below is a description of every field:
 # Your Azure AD Tenant ID (GUID from Step 1)
 AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000
 
-# One or more Azure subscription IDs to query (comma-separated).
-# Single subscription:
+# One or more Azure subscription IDs (comma-separated).
 AZURE_SUBSCRIPTION_IDS=11111111-1111-1111-1111-111111111111
-# Multiple subscriptions (aks_list_clusters and health events iterate all of them):
-# AZURE_SUBSCRIPTION_IDS=11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222
+# Multiple: AZURE_SUBSCRIPTION_IDS=11111111-...,22222222-...
 
 # ── App Registration ──────────────────────────────────────────────────────────
 # Application (client) ID of your app registration (from Step 2)
 AZURE_AD_APP_CLIENT_ID=22222222-2222-2222-2222-222222222222
 
 # Client secret of the SAME app registration (from Step 3b).
-# Used for the On-Behalf-Of (OBO) token exchange: Azure API calls run as
-# the signed-in user, so their Azure RBAC determines what they can access.
-# Leave blank to fall back to `az login` (local dev) or Workload Identity
-# (AKS pod). Without this, all users see the same resources as the server.
+# Used for the On-Behalf-Of (OBO) token exchange so the API can confirm
+# the caller's identity. Leave blank to fall back to `az login` (local dev)
+# or Workload Identity (AKS pod).
 AZURE_CLIENT_SECRET=
 
-# ── Kubernetes ────────────────────────────────────────────────────────────────
-# Leave blank to use ~/.kube/config (the default after `az aks get-credentials`)
-KUBECONFIG=
-# Leave blank to use the current context in your kubeconfig
-K8S_CONTEXT=
-# Set to true only if deploying this server as a pod inside an AKS cluster
-K8S_IN_CLUSTER=false
-
-# ── MCP Server ────────────────────────────────────────────────────────────────
-# stdio = agents launch the server as a child process (default, recommended)
-# sse   = server listens on HTTP for direct MCP connections
-MCP_TRANSPORT=stdio
-MCP_HOST=127.0.0.1
-MCP_PORT=8090
+# ── Official AKS MCP server (github.com/Azure/aks-mcp) ───────────────────────
+# Path to the aks-mcp binary. Run `make install-aks-mcp` to download it.
+AKS_MCP_BINARY=./bin/aks-mcp
+# Access level passed to the binary. Keep as readonly unless you know what
+# you are doing — write access enables cluster mutations.
+AKS_MCP_ACCESS_LEVEL=readonly
 
 # ── Azure AI Foundry ──────────────────────────────────────────────────────────
 # Inference endpoint URL from Step 5
@@ -373,6 +468,8 @@ LOG_FORMAT=json  # json | console
 ```
 
 > **Security note:** Never commit `.env` to git. It is already in `.gitignore`.
+
+> **Kubernetes auth:** The `aks-mcp` binary discovers kubeconfig automatically — it reads `KUBECONFIG` env var or `~/.kube/config`, exactly like `kubectl`. You do not need to configure this separately.
 
 ---
 
@@ -866,7 +963,7 @@ The full list of configurable values with their defaults:
 make test
 ```
 
-Expected output: **80 tests pass**.
+Expected output: all tests pass (MCP-server-specific tests were removed in v2.0.0 when the official binary replaced the custom Python server).
 
 To also see code coverage:
 
@@ -889,18 +986,22 @@ The React frontend uses **MSAL PKCE redirect flow**. After login the FastAPI bac
 The backend then performs an **On-Behalf-Of (OBO)** token exchange:
 
 4. Exchanges the user's app token for an Azure Resource Manager token.
-5. Injects the ARM token into the MCP server subprocess.
-6. All Azure SDK calls run as the signed-in user — Azure RBAC determines what is returned.
+5. The ARM token confirms the caller's identity in logs. It is also available for future use (e.g. per-user Azure SDK calls outside aks-mcp).
 
-### Azure credential chain in the MCP server
+> **Note on credential model:** The `aks-mcp` binary authenticates using the **server's identity** (Service Principal env vars, Workload Identity, or `az login`). It does not accept a per-request injected token. Azure RBAC enforcement therefore applies to the server's managed identity, not to each individual user. See the [Session Isolation — Known Limitations](#session-isolation) section.
+
+### Azure credential chain in `aks-mcp`
+
+The binary follows the standard Azure SDK `DefaultAzureCredential` chain:
 
 | Priority | Credential | When used |
 |----------|-----------|-----------|
-| 1 | `StaticTokenCredential` (OBO ARM token) | `AZURE_ARM_TOKEN` set (per-request, injected by API) |
-| 2 | `AzureCliCredential` | Local dev fallback: user has run `az login` |
-| 3 | `ManagedIdentityCredential` | AKS pod with Workload Identity (no OBO configured) |
+| 1 | Service Principal | `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` + `AZURE_TENANT_ID` set |
+| 2 | Workload Identity | `AZURE_FEDERATED_TOKEN_FILE` set (AKS pod with Workload Identity) |
+| 3 | Managed Identity | Running on Azure VM / AKS with system-assigned identity |
+| 4 | Azure CLI | Local dev: user has run `az login` |
 
-Required Azure RBAC roles on the **user's identity** (or their AD groups):
+Required Azure RBAC roles on the **server's identity** (Service Principal or Managed Identity):
 - `Reader` on the subscription or resource group
 - `Monitoring Reader` on the subscription (for Azure Monitor metrics)
 
@@ -909,16 +1010,16 @@ Required Azure RBAC roles on the **user's identity** (or their AD groups):
 | Priority | Method | When used |
 |----------|--------|-----------|
 | 1 | API key (`AzureKeyCredential`) | `AZURE_FOUNDRY_API_KEY` is set |
-| 2 | Server-level Azure AD credential | Key not set (OBO does not apply here) |
+| 2 | Server-level Azure AD credential | Key not set |
 
 ### Kubernetes
 
+The `aks-mcp` binary discovers kubeconfig the same way `kubectl` does:
+
 | Priority | Method | When used |
 |----------|--------|-----------|
-| 1 | In-cluster ServiceAccount | `KUBERNETES_SERVICE_HOST` set or `K8S_IN_CLUSTER=true` |
-| 2 | Kubeconfig | `KUBECONFIG` env or `~/.kube/config` |
-
-Kubernetes tools always use the server's own ServiceAccount — they are not subject to OBO.
+| 1 | In-cluster ServiceAccount | `KUBERNETES_SERVICE_HOST` set (running as a pod) |
+| 2 | Kubeconfig | `KUBECONFIG` env var or `~/.kube/config` |
 
 ---
 
@@ -960,15 +1061,18 @@ kubectl create clusterrolebinding aks-health-mcp-reader \
 |---------|---------------|
 | **AI Firewall** | Two-stage input guard on every query: fast regex block (prompt injection, credential extraction, destructive ops) followed by LLM relevance classifier. Fails open — infra failures never block legitimate queries. See `agents/firewall.py`. |
 | **Hallucination Reviewer** | LLM second-pass cross-checks the synthesised answer against raw tool data. Corrects fabricated cluster names, counts, or statuses and appends a transparency note when changes are made. See `agents/reviewer.py`. |
-| Read-only MCP tools | No create/update/delete/patch SDK call is ever made; enforced by `test_no_write_tools_registered` |
-| Credential isolation | Credentials loaded from env only; tool arguments never accept secrets |
-| Secret masking | `pydantic.SecretStr` + structlog `_scrub_sensitive` processor on all log output |
-| Audit logging | Every tool call and HTTP request logged with tool name, UPN, OID (no secret values) |
-| Azure RBAC enforcement | OBO flow: Azure API calls run as the user; Azure evaluates role assignments at query time |
-| CORS | Single configured origin; no wildcards |
-| Token validation | RS256 + JWKS cache (1 h TTL); audience accepts `<clientId>` and `api://<clientId>` |
-| Rate limiting | Tenacity exponential back-off on all Azure API calls |
-| MCP SSE transport | Binds to `127.0.0.1` by default; use a TLS-terminating reverse proxy for production |
+| **Read-only access level** | aks-mcp binary started with `--access-level readonly`; write tools are unavailable regardless of agent instructions. `AKS_MCP_ACCESS_LEVEL` can only be raised by explicit operator config change. |
+| **Process isolation** | Every agent invocation spawns a fresh `aks-mcp` child process. Process terminates at end of request. No in-memory state shared between users. |
+| **Log context isolation** | `structlog` uses `contextvars` (asyncio-task-local). `query_id` and `user_oid` are bound at request start and unbound in `finally`. `clear_contextvars()` is never called (would drop middleware's `request_id`). |
+| **Child process env filtering** | `AZURE_FOUNDRY_API_KEY`, `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_MODEL`, and `AZURE_ARM_TOKEN` are stripped before the child env is passed to aks-mcp (principle of least privilege). |
+| **Error message sanitisation** | Internal exception details are logged server-side only; the SSE stream returns a generic message to the client. |
+| Credential isolation | Credentials loaded from env at startup; MCP tool arguments never accept secrets. |
+| Secret masking | `pydantic.SecretStr` for all secret fields; structlog scrubs known-secret key names in log output. |
+| Audit logging | Every tool call and HTTP request logged with tool name, UPN, OID (no secret values). |
+| Concurrency cap | `asyncio.Semaphore(5)` limits concurrent agent calls; prevents resource exhaustion. |
+| Azure RBAC enforcement | Azure RBAC roles on the server's identity determine which subscriptions and resources are accessible. |
+| CORS | Single configured `FRONTEND_ORIGIN`; no wildcards. |
+| Token validation | RS256 + JWKS cache (1 h TTL, bounded to 10 tenants); audience accepts `<clientId>` and `api://<clientId>`; separate tenant keys cannot mix. |
 
 ---
 
@@ -1011,9 +1115,10 @@ cp frontend/.env.example frontend/.env
 ### Agent returns "Tool execution failed"
 
 Check that:
-1. The MCP server can start on its own: `python -m server.main` (it will block on stdin — press Ctrl+C to exit; if it starts without errors, the server is working).
-2. The Azure credential has the `Reader` and `Monitoring Reader` roles.
-3. The kubeconfig is pointing to the right cluster.
+1. The `aks-mcp` binary is on PATH or `AKS_MCP_BINARY` in `.env` points to the correct path. Verify: `aks-mcp --version` (or `./bin/aks-mcp --version`).
+2. Azure CLI and kubectl are installed and on PATH — the binary shells out to them.
+3. The Azure credential (Service Principal or `az login`) has the `Reader` and `Monitoring Reader` roles.
+4. The kubeconfig is pointing to the right cluster: `kubectl get nodes`.
 
 ### "Query not allowed" error returned to the browser
 
@@ -1076,33 +1181,33 @@ The cluster cannot pull the image. Check:
 
 ```
 aks-health-mcp/
-├── server/                        # MCP server
-│   ├── main.py                    # FastMCP entry point, 16 tool registrations
-│   ├── config.py                  # Pydantic-settings (SecretStr masking)
-│   ├── logging_config.py          # structlog structured logging
-│   ├── auth/
-│   │   └── credentials.py         # Azure + K8s credential chain factories
-│   └── tools/
-│       ├── azure_aks.py           # Azure RM read tools (aks_*)
-│       └── cluster_k8s.py         # Kubernetes read tools (k8s_*)
+├── bin/                           # Downloaded aks-mcp binary (git-ignored)
+│   └── aks-mcp                    # Official Microsoft Go binary (make install-aks-mcp)
+│
+├── server/                        # Shared config / auth / logging utilities
+│   ├── config.py                  # Pydantic-settings: AKS_MCP_BINARY, Azure, Foundry
+│   ├── logging_config.py          # structlog structured logging setup
+│   └── auth/
+│       └── credentials.py         # Azure credential chain factory (CLI / Workload Identity)
 │
 ├── agents/                        # Azure AI Foundry multi-agent framework
-│   ├── base.py                    # Base class: MCP stdio client + conversation loop
-│   ├── root_agent.py              # Root orchestrator (concurrent sub-agent dispatch)
+│   ├── base.py                    # Base class: spawns aks-mcp via stdio, conversation loop
+│   │                              # tool_prefixes tuple filtering, child-env secret stripping
+│   ├── root_agent.py              # Root orchestrator (concurrent asyncio sub-agent dispatch)
 │   ├── firewall.py                # AI input guard (regex + LLM classifier)
 │   ├── reviewer.py                # Hallucination reviewer (LLM grounding check)
 │   └── task_agents/
-│       ├── azure_health_agent.py  # Scoped to aks_* tools
-│       └── cluster_health_agent.py# Scoped to k8s_* tools
+│       ├── azure_health_agent.py  # tool_prefixes: az_  aks_  get_aks_  call_az
+│       └── cluster_health_agent.py# tool_prefixes: call_kubectl  call_helm  collect_  inspektor_
 │
 ├── api/                           # FastAPI backend (SSO portal bridge)
-│   ├── main.py                    # App factory, CORS, request logging, probes
+│   ├── main.py                    # App factory, CORS, request logging, health probes
 │   ├── config.py                  # ApiSettings (extends server Settings)
 │   ├── auth/
-│   │   └── azure_ad.py            # JWT validation, JWKS cache
+│   │   └── azure_ad.py            # JWT validation (RS256), JWKS cache, OBO exchange
 │   └── routes/
 │       ├── auth.py                # GET /api/auth/me
-│       └── agent.py               # POST /api/agent/query (SSE stream)
+│       └── agent.py               # POST /api/agent/query (SSE stream, contextvars isolation)
 │
 ├── frontend/                      # React sysadmin portal
 │   ├── src/
@@ -1112,55 +1217,40 @@ aks-health-mcp/
 │   │   ├── hooks/
 │   │   │   ├── useGroupAuth.ts    # Silent token + /auth/me validation
 │   │   │   └── useAgentQuery.ts   # SSE lifecycle: idle→loading→done
-│   │   ├── components/
-│   │   │   ├── ProtectedRoute.tsx # Auth + group gate
-│   │   │   ├── Dashboard.tsx      # Main layout + history sidebar
-│   │   │   ├── HealthReport.tsx   # Markdown renderer + skeleton loading
-│   │   │   ├── QueryInput.tsx     # Textarea + suggested-query chips
-│   │   │   ├── LoginPage.tsx      # Microsoft sign-in card
-│   │   │   ├── AccessDenied.tsx   # Shown for unauthorised users
-│   │   │   └── Header.tsx         # User info + sign-out
-│   │   └── types/index.ts         # Shared TypeScript types
+│   │   └── components/
+│   │       ├── ProtectedRoute.tsx # Auth gate
+│   │       ├── Dashboard.tsx      # Main layout + history sidebar
+│   │       ├── HealthReport.tsx   # Markdown renderer + skeleton loading
+│   │       ├── QueryInput.tsx     # Textarea + suggested-query chips
+│   │       ├── LoginPage.tsx      # Microsoft sign-in card
+│   │       ├── AccessDenied.tsx   # Shown for unauthorised users
+│   │       └── Header.tsx         # User info + sign-out
 │   ├── package.json
 │   ├── vite.config.ts             # Dev proxy → localhost:8000
-│   └── tailwind.config.js         # Azure blue palette + custom typography
+│   └── tailwind.config.js
 │
-├── tests/                         # 80 tests
-│   ├── conftest.py
-│   ├── test_config.py
-│   ├── test_mcp_server.py
-│   ├── test_azure_tools.py
-│   ├── test_cluster_tools.py
-│   ├── test_agents.py
-│   ├── test_api_auth.py
-│   ├── test_firewall.py           # AI firewall (13 tests)
-│   └── test_reviewer.py           # Hallucination reviewer (7 tests)
+├── tests/
+│   ├── conftest.py                # Env stubs, lru_cache clear between tests
+│   ├── test_config.py             # Settings validation, SecretStr masking
+│   ├── test_agents.py             # Agent tool_prefixes, tool filtering, mock MCP sessions
+│   ├── test_api_auth.py           # JWT validation, JWKS cache isolation, CORS
+│   ├── test_firewall.py           # AI firewall: regex patterns + LLM classifier mock
+│   └── test_reviewer.py           # Hallucination reviewer: grounding checks
 │
-├── Dockerfile                         # Backend multi-stage Docker build
+├── Dockerfile                     # 3-stage build: aks-mcp binary + Python deps + runtime
 ├── .dockerignore
 ├── deploy/
-│   └── nginx.conf                     # nginx config for frontend container
+│   └── nginx.conf                 # nginx config for frontend container
 ├── frontend/
-│   └── Dockerfile                     # Frontend multi-stage Docker build (nginx-unprivileged)
+│   └── Dockerfile                 # Frontend multi-stage Docker build (nginx-unprivileged)
 ├── helm/
 │   └── aks-health/
 │       ├── Chart.yaml
-│       ├── values.yaml                # Full defaults + inline docs
-│       └── templates/
-│           ├── _helpers.tpl
-│           ├── NOTES.txt
-│           ├── serviceaccount.yaml
-│           ├── rbac.yaml              # Read-only ClusterRole + binding
-│           ├── configmap.yaml         # Non-sensitive config
-│           ├── secret.yaml            # Credentials (conditional)
-│           ├── backend-deployment.yaml
-│           ├── backend-service.yaml
-│           ├── backend-hpa.yaml       # HPA (conditional)
-│           ├── frontend-deployment.yaml
-│           ├── frontend-service.yaml
-│           └── ingress.yaml           # Ingress (conditional)
-├── pyproject.toml                     # deps: base + api + dev extras
-├── Makefile
-├── .env.example                       # Copy to .env and fill in values
-└── frontend/.env.example              # Copy to frontend/.env and fill in values
+│       ├── values.yaml            # Full defaults + inline docs
+│       └── templates/             # ServiceAccount, RBAC, ConfigMap, Secret, Deployment,
+│                                  # Service, HPA, Ingress
+├── pyproject.toml                 # v2.0.0 – mcp client + azure-identity + foundry only
+├── Makefile                       # install-aks-mcp, run-api, run-agent, test, lint
+├── .env.example                   # Copy to .env and fill in values
+└── frontend/.env.example          # Copy to frontend/.env and fill in values
 ```

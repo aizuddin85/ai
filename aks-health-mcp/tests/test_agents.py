@@ -19,14 +19,18 @@ from agents.task_agents.cluster_health_agent import ClusterHealthAgent
 # ---------------------------------------------------------------------------
 
 
-def test_azure_health_agent_tool_prefix() -> None:
+def test_azure_health_agent_tool_prefixes() -> None:
     agent = AzureHealthAgent.__new__(AzureHealthAgent)
-    assert agent.tool_prefix == "aks_"
+    # Must cover the key official aks-mcp tool name prefixes
+    assert "az_" in agent.tool_prefixes
+    assert "aks_" in agent.tool_prefixes
 
 
-def test_cluster_health_agent_tool_prefix() -> None:
+def test_cluster_health_agent_tool_prefixes() -> None:
     agent = ClusterHealthAgent.__new__(ClusterHealthAgent)
-    assert agent.tool_prefix == "k8s_"
+    # Must cover kubectl and ecosystem CLI tools
+    assert any(p.startswith("call_kubectl") for p in agent.tool_prefixes)
+    assert any(p.startswith("collect_") for p in agent.tool_prefixes)
 
 
 def test_azure_health_agent_name() -> None:
@@ -90,57 +94,59 @@ def test_agent_uses_key_when_configured(
 
 
 @pytest.mark.asyncio
-async def test_discover_tools_filters_by_prefix() -> None:
-    """AzureHealthAgent should only expose aks_* tools."""
+async def test_discover_tools_filters_azure_prefixes() -> None:
+    """AzureHealthAgent should expose az_* and aks_* tools but not call_kubectl."""
     from mcp.types import Tool
     from server.logging_config import get_logger
 
     agent = AzureHealthAgent.__new__(AzureHealthAgent)
-    agent.tool_prefix = "aks_"
     agent._log = get_logger("test")
 
-    # Build a mock MCP session that returns mixed tools
     mock_session = AsyncMock()
     mock_response = MagicMock()
     mock_response.tools = [
-        Tool(name="aks_list_clusters", description="Azure tool", inputSchema={"type": "object", "properties": {}}),
-        Tool(name="k8s_get_nodes", description="K8s tool", inputSchema={"type": "object", "properties": {}}),
-        Tool(name="aks_get_metrics", description="Azure tool 2", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="az_aks_operations", description="Azure AKS ops", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="aks_monitoring", description="AKS monitoring", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="call_kubectl", description="kubectl", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="get_aks_vmss_info", description="VMSS info", inputSchema={"type": "object", "properties": {}}),
     ]
     mock_session.list_tools = AsyncMock(return_value=mock_response)
 
     result = await agent._discover_tools(mock_session)
 
     tool_names = [t.function.name for t in result]
-    assert "aks_list_clusters" in tool_names
-    assert "aks_get_metrics" in tool_names
-    assert "k8s_get_nodes" not in tool_names
-    assert len(result) == 2
+    assert "az_aks_operations" in tool_names
+    assert "aks_monitoring" in tool_names
+    assert "get_aks_vmss_info" in tool_names
+    assert "call_kubectl" not in tool_names
 
 
 @pytest.mark.asyncio
-async def test_discover_tools_filters_k8s_prefix() -> None:
-    """ClusterHealthAgent should only expose k8s_* tools."""
+async def test_discover_tools_filters_cluster_prefixes() -> None:
+    """ClusterHealthAgent should expose call_kubectl and collect_* but not az_* tools."""
     from mcp.types import Tool
     from server.logging_config import get_logger
 
     agent = ClusterHealthAgent.__new__(ClusterHealthAgent)
-    agent.tool_prefix = "k8s_"
     agent._log = get_logger("test")
 
     mock_session = AsyncMock()
     mock_response = MagicMock()
     mock_response.tools = [
-        Tool(name="aks_list_clusters", description="Azure tool", inputSchema={"type": "object", "properties": {}}),
-        Tool(name="k8s_get_nodes", description="K8s tool", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="call_kubectl", description="kubectl", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="collect_aks_node_logs", description="node logs", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="az_aks_operations", description="Azure ops", inputSchema={"type": "object", "properties": {}}),
+        Tool(name="inspektor_gadget_observability", description="eBPF", inputSchema={"type": "object", "properties": {}}),
     ]
     mock_session.list_tools = AsyncMock(return_value=mock_response)
 
     result = await agent._discover_tools(mock_session)
 
     tool_names = [t.function.name for t in result]
-    assert "k8s_get_nodes" in tool_names
-    assert "aks_list_clusters" not in tool_names
+    assert "call_kubectl" in tool_names
+    assert "collect_aks_node_logs" in tool_names
+    assert "inspektor_gadget_observability" in tool_names
+    assert "az_aks_operations" not in tool_names
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +158,6 @@ async def test_discover_tools_filters_k8s_prefix() -> None:
 async def test_execute_tool_returns_text_content() -> None:
     """_execute_tool should return the tool result text."""
     agent = AzureHealthAgent.__new__(AzureHealthAgent)
-    agent.tool_prefix = "aks_"
     agent.tool_results = []
     from server.logging_config import get_logger
     agent._log = get_logger("test")
@@ -164,7 +169,7 @@ async def test_execute_tool_returns_text_content() -> None:
     mock_result.content = [mock_content]
     mock_session.call_tool = AsyncMock(return_value=mock_result)
 
-    result = await agent._execute_tool(mock_session, "aks_list_clusters", {})
+    result = await agent._execute_tool(mock_session, "az_aks_operations", {})
     parsed = json.loads(result)
     assert parsed["count"] == 0
 
@@ -173,7 +178,6 @@ async def test_execute_tool_returns_text_content() -> None:
 async def test_execute_tool_handles_exception() -> None:
     """_execute_tool should return error JSON on exception."""
     agent = AzureHealthAgent.__new__(AzureHealthAgent)
-    agent.tool_prefix = "aks_"
     agent.tool_results = []
     from server.logging_config import get_logger
     agent._log = get_logger("test")
@@ -181,7 +185,7 @@ async def test_execute_tool_handles_exception() -> None:
     mock_session = AsyncMock()
     mock_session.call_tool = AsyncMock(side_effect=RuntimeError("Connection refused"))
 
-    result = await agent._execute_tool(mock_session, "aks_list_clusters", {})
+    result = await agent._execute_tool(mock_session, "az_aks_operations", {})
     parsed = json.loads(result)
     assert "error" in parsed
     assert "Connection refused" in parsed["error"]

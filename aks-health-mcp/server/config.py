@@ -51,30 +51,21 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Per-request ARM token injected by the agent layer after OBO exchange.
-    # Set automatically via AZURE_ARM_TOKEN env var in the MCP subprocess;
-    # do not set this manually.
-    azure_arm_token: str | None = Field(
-        default=None,
-        description="OBO-exchanged ARM access token (injected per-request into subprocess).",
+    # ------------------------------------------------------------------
+    # AKS MCP server (official Microsoft binary: github.com/Azure/aks-mcp)
+    # ------------------------------------------------------------------
+    aks_mcp_binary: str = Field(
+        default="aks-mcp",
+        description=(
+            "Path or name of the official aks-mcp binary.  "
+            "Defaults to 'aks-mcp' (assumes it is on PATH).  "
+            "Override with an absolute path, e.g. /usr/local/bin/aks-mcp."
+        ),
     )
-
-    # ------------------------------------------------------------------
-    # Kubernetes authentication
-    # ------------------------------------------------------------------
-    kubeconfig: str | None = Field(default=None, description="Path to kubeconfig file")
-    k8s_context: str | None = Field(default=None, description="Kubeconfig context to use")
-    k8s_in_cluster: bool = Field(default=False, description="Force in-cluster auth mode")
-
-    # ------------------------------------------------------------------
-    # MCP server
-    # ------------------------------------------------------------------
-    mcp_transport: Literal["stdio", "sse"] = Field(
-        default="stdio", description="MCP transport layer"
+    aks_mcp_access_level: Literal["readonly", "readwrite", "admin"] = Field(
+        default="readonly",
+        description="Access level passed to the aks-mcp binary (--access-level flag).",
     )
-    mcp_host: str = Field(default="127.0.0.1", description="SSE host (sse transport only)")
-    mcp_port: int = Field(default=8090, description="SSE port (sse transport only)")
-    api_timeout_seconds: int = Field(default=30, description="Azure/K8s API call timeout")
 
     # ------------------------------------------------------------------
     # Azure AI Foundry (agents)

@@ -1,5 +1,5 @@
 """
-Azure and Kubernetes credential factories.
+Azure credential factory.
 
 Azure credential chain (highest-priority first):
   1. OBO ARM token  – when AZURE_ARM_TOKEN is set (per-request, user's identity)
@@ -13,13 +13,6 @@ Azure credential chain (highest-priority first):
 
 Note: the AZURE_ARM_TOKEN path is not cached with lru_cache because the
 token changes on every request.  The fallback chain (CLI / MI) IS cached.
-
-Kubernetes credential:
-  1. In-cluster ServiceAccount token
-  2. Kubeconfig file (with optional context override)
-
-Kubernetes always uses the server's own service account — it is not
-subject to the OBO flow.
 """
 from __future__ import annotations
 
@@ -106,31 +99,3 @@ def _get_cached_credential() -> "TokenCredential":
     )
 
 
-def get_kubernetes_client() -> tuple[object, object]:
-    """
-    Return (CoreV1Api, AppsV1Api) clients, loading config from the
-    appropriate source.
-
-    Returns a tuple so callers don't need to import kubernetes directly.
-    """
-    from kubernetes import client as k8s_client
-    from kubernetes import config as k8s_config
-
-    in_cluster_forced = os.getenv("K8S_IN_CLUSTER", "false").lower() == "true"
-    in_cluster_auto = bool(os.getenv("KUBERNETES_SERVICE_HOST"))
-
-    if in_cluster_forced or in_cluster_auto:
-        logger.info("k8s.auth.mode", mode="in_cluster")
-        k8s_config.load_incluster_config()
-    else:
-        kubeconfig = os.getenv("KUBECONFIG") or None
-        context = os.getenv("K8S_CONTEXT") or None
-        logger.info("k8s.auth.mode", mode="kubeconfig", context=context or "default")
-        k8s_config.load_kube_config(config_file=kubeconfig, context=context)
-
-    configuration = k8s_client.Configuration.get_default_copy()
-    api_client = k8s_client.ApiClient(configuration)
-    return (
-        k8s_client.CoreV1Api(api_client),
-        k8s_client.AppsV1Api(api_client),
-    )

@@ -123,7 +123,11 @@ async def _run_agent_stream(
     # line emitted anywhere in the agent pipeline (root agent, sub-agents,
     # firewall, reviewer) automatically carries query_id and user_oid.
     # contextvars are isolated per asyncio task — no cross-session leakage.
-    structlog.contextvars.clear_contextvars()
+    #
+    # IMPORTANT: do NOT call clear_contextvars() here.  The HTTP middleware
+    # already bound request_id to this task's context; clearing would drop
+    # it and break request-level log correlation.  Targeted bind/unbind
+    # keeps request_id intact while adding the agent-layer keys.
     structlog.contextvars.bind_contextvars(
         query_id=query_id,
         user_oid=user.oid,
@@ -190,15 +194,20 @@ async def _run_agent_stream(
                 "message": "Query was cancelled.",
             })
         except Exception as exc:  # noqa: BLE001
-            log.error("agent.query.error", error=str(exc))
+            # Log the full exception server-side but return a generic message
+            # to the client to avoid leaking internal paths or stack traces.
+            log.error("agent.query.error", error=str(exc), exc_info=True)
             yield _sse({
                 "type": "error",
                 "query_id": query_id,
-                "message": f"Agent error: {exc}",
+                "message": "An unexpected error occurred. Check server logs for details.",
             })
         finally:
             # Always cancel the heartbeat and emit the terminal event.
             heartbeat_task.cancel()
+            # Remove agent-layer context vars; the middleware's request_id
+            # remains intact for any log lines that follow in the same task.
+            structlog.contextvars.unbind_contextvars("query_id", "user_oid")
             yield _sse({"type": "done", "query_id": query_id})
 
 
