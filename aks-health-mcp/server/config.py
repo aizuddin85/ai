@@ -87,7 +87,7 @@ class Settings(BaseSettings):
         ..., description="Azure AI Foundry inference endpoint URL"
     )
     azure_foundry_model: str = Field(
-        default="gpt-4o",
+        ...,
         description="Model deployment name in Azure AI Foundry",
     )
     azure_foundry_api_key: SecretStr | None = Field(

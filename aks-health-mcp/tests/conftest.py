@@ -16,6 +16,7 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AZURE_SUBSCRIPTION_ID", raising=False)
     monkeypatch.setenv("AZURE_FOUNDRY_ENDPOINT", "https://test-project.services.ai.azure.com/models")
     monkeypatch.setenv("AZURE_FOUNDRY_MODEL", "gpt-4o")
+    monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:5173")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("LOG_FORMAT", "console")
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")

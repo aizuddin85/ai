@@ -67,9 +67,17 @@ def test_invalid_log_level_rejected() -> None:
         Settings(**_BASE, log_level="VERBOSE")  # type: ignore[arg-type]
 
 
-def test_default_foundry_model() -> None:
+def test_missing_foundry_model_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AZURE_FOUNDRY_MODEL is required — no hardcoded default exists."""
+    monkeypatch.delenv("AZURE_FOUNDRY_MODEL", raising=False)
+    with pytest.raises(ValidationError):
+        Settings(**_BASE)  # type: ignore[call-arg]
+
+
+def test_foundry_model_read_from_env() -> None:
+    """Model name is read from AZURE_FOUNDRY_MODEL env var (set by conftest)."""
     s = Settings(**_BASE)  # type: ignore[arg-type]
-    assert s.azure_foundry_model == "gpt-4o"
+    assert s.azure_foundry_model == "gpt-4o"  # value injected by conftest
 
 
 def test_custom_foundry_model() -> None:
