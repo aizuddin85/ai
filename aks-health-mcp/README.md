@@ -45,11 +45,17 @@ Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **Rea
 │                     Sysadmin Browser                         │
 │              React + MSAL (Azure AD SSO / PKCE)              │
 └────────────────────────┬─────────────────────────────────────┘
-                         │  Bearer token (AD group-gated)
+                         │  Bearer token
                          ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                    FastAPI Backend                            │
-│  JWT validation · groups-claim check · SSE streaming         │
+│  JWT validation · OBO token exchange · SSE streaming         │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │  AI Firewall  (fast regex + LLM classifier)         │     │
+│  │  Blocks: prompt injection · credential extraction   │     │
+│  │          destructive ops · off-topic queries         │     │
+│  └─────────────────────────────────────────────────────┘     │
 └────────────────────────┬─────────────────────────────────────┘
                          │
                          ▼
@@ -72,6 +78,14 @@ Includes a **multi-agent framework** powered by **Azure AI Foundry** and a **Rea
           │   │  Azure AKS tools      │───┼──▶ Azure Resource Manager API
           │   │  Kubernetes tools     │───┼──▶ Kubernetes API
           │   └───────────────────────┘   │
+          └───────────────────────────────┘
+                          │
+                          ▼
+          ┌───────────────────────────────┐
+          │  Hallucination Reviewer       │
+          │  LLM cross-checks answer vs   │
+          │  raw tool data; corrects and  │
+          │  flags fabricated facts       │
           └───────────────────────────────┘
 ```
 
@@ -852,7 +866,7 @@ The full list of configurable values with their defaults:
 make test
 ```
 
-Expected output: **59 tests pass**.
+Expected output: **80 tests pass**.
 
 To also see code coverage:
 
@@ -944,6 +958,8 @@ kubectl create clusterrolebinding aks-health-mcp-reader \
 
 | Control | Implementation |
 |---------|---------------|
+| **AI Firewall** | Two-stage input guard on every query: fast regex block (prompt injection, credential extraction, destructive ops) followed by LLM relevance classifier. Fails open — infra failures never block legitimate queries. See `agents/firewall.py`. |
+| **Hallucination Reviewer** | LLM second-pass cross-checks the synthesised answer against raw tool data. Corrects fabricated cluster names, counts, or statuses and appends a transparency note when changes are made. See `agents/reviewer.py`. |
 | Read-only MCP tools | No create/update/delete/patch SDK call is ever made; enforced by `test_no_write_tools_registered` |
 | Credential isolation | Credentials loaded from env only; tool arguments never accept secrets |
 | Secret masking | `pydantic.SecretStr` + structlog `_scrub_sensitive` processor on all log output |
@@ -998,6 +1014,19 @@ Check that:
 1. The MCP server can start on its own: `python -m server.main` (it will block on stdin — press Ctrl+C to exit; if it starts without errors, the server is working).
 2. The Azure credential has the `Reader` and `Monitoring Reader` roles.
 3. The kubeconfig is pointing to the right cluster.
+
+### "Query not allowed" error returned to the browser
+
+The AI firewall blocked the query before it reached the agent. Two stages run in sequence:
+
+1. **Fast regex check** — pattern-matched against known bad inputs (prompt injection phrases, credential extraction requests, destructive kubectl commands). These are always blocked regardless of LLM availability.
+2. **LLM relevance check** — an Azure AI Foundry call classifies whether the query is related to AKS/Kubernetes health. Unrelated queries (weather, cooking, etc.) are blocked here.
+
+If a legitimate AKS query is blocked by the LLM classifier, rephrase it to make the Kubernetes/Azure context explicit (e.g. "What is the pod status in my AKS cluster?" instead of just "What is running?").
+
+The firewall **fails open** — if Azure AI Foundry is unreachable, the query passes through so legitimate work is never interrupted.
+
+---
 
 ### `403 Forbidden` on `/api/auth/me` in Postman / curl
 
@@ -1060,6 +1089,8 @@ aks-health-mcp/
 ├── agents/                        # Azure AI Foundry multi-agent framework
 │   ├── base.py                    # Base class: MCP stdio client + conversation loop
 │   ├── root_agent.py              # Root orchestrator (concurrent sub-agent dispatch)
+│   ├── firewall.py                # AI input guard (regex + LLM classifier)
+│   ├── reviewer.py                # Hallucination reviewer (LLM grounding check)
 │   └── task_agents/
 │       ├── azure_health_agent.py  # Scoped to aks_* tools
 │       └── cluster_health_agent.py# Scoped to k8s_* tools
@@ -1068,7 +1099,7 @@ aks-health-mcp/
 │   ├── main.py                    # App factory, CORS, request logging, probes
 │   ├── config.py                  # ApiSettings (extends server Settings)
 │   ├── auth/
-│   │   └── azure_ad.py            # JWT validation, JWKS cache, group check
+│   │   └── azure_ad.py            # JWT validation, JWKS cache
 │   └── routes/
 │       ├── auth.py                # GET /api/auth/me
 │       └── agent.py               # POST /api/agent/query (SSE stream)
@@ -1079,7 +1110,7 @@ aks-health-mcp/
 │   │   ├── App.tsx                # Router + MsalProvider
 │   │   ├── api/agentApi.ts        # Typed API client (fetch + SSE parser)
 │   │   ├── hooks/
-│   │   │   ├── useGroupAuth.ts    # Silent token + /auth/me group check
+│   │   │   ├── useGroupAuth.ts    # Silent token + /auth/me validation
 │   │   │   └── useAgentQuery.ts   # SSE lifecycle: idle→loading→done
 │   │   ├── components/
 │   │   │   ├── ProtectedRoute.tsx # Auth + group gate
@@ -1094,14 +1125,16 @@ aks-health-mcp/
 │   ├── vite.config.ts             # Dev proxy → localhost:8000
 │   └── tailwind.config.js         # Azure blue palette + custom typography
 │
-├── tests/                         # 55 tests
+├── tests/                         # 80 tests
 │   ├── conftest.py
 │   ├── test_config.py
 │   ├── test_mcp_server.py
 │   ├── test_azure_tools.py
 │   ├── test_cluster_tools.py
 │   ├── test_agents.py
-│   └── test_api_auth.py
+│   ├── test_api_auth.py
+│   ├── test_firewall.py           # AI firewall (13 tests)
+│   └── test_reviewer.py           # Hallucination reviewer (7 tests)
 │
 ├── Dockerfile                         # Backend multi-stage Docker build
 ├── .dockerignore
