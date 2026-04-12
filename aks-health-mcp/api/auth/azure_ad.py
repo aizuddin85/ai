@@ -41,8 +41,13 @@ _bearer = HTTPBearer(auto_error=True)
 # ---------------------------------------------------------------------------
 # JWKS cache (per tenant)
 # ---------------------------------------------------------------------------
+# Keyed by tenant_id → (fetch_timestamp, jwks_data).
+# Bounded to _JWKS_CACHE_MAX_SIZE entries to prevent unbounded growth.
+# Each entry expires after _JWKS_TTL seconds; expired entries are evicted
+# on the next write so the dict never accumulates stale public-key material.
 _jwks_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-_JWKS_TTL = 3600  # 1 hour
+_JWKS_TTL = 3600         # seconds before a cached JWKS is re-fetched
+_JWKS_CACHE_MAX_SIZE = 10  # upper bound on number of cached tenants
 
 
 async def _get_jwks(tenant_id: str) -> dict[str, Any]:
@@ -50,8 +55,9 @@ async def _get_jwks(tenant_id: str) -> dict[str, Any]:
     Fetch (or return cached) JWKS for the given tenant.
     Uses an async httpx client; raises HTTPException on failure.
     """
+    now = time.time()
     cached = _jwks_cache.get(tenant_id)
-    if cached and (time.time() - cached[0]) < _JWKS_TTL:
+    if cached and (now - cached[0]) < _JWKS_TTL:
         return cached[1]
 
     url = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
@@ -67,7 +73,16 @@ async def _get_jwks(tenant_id: str) -> dict[str, Any]:
             detail="Unable to reach Azure AD JWKS endpoint",
         ) from exc
 
-    _jwks_cache[tenant_id] = (time.time(), data)
+    # Evict all expired entries, then enforce the hard size cap by removing
+    # the oldest entry.  Both evictions happen before the new entry is written
+    # so the dict never exceeds _JWKS_CACHE_MAX_SIZE entries.
+    for stale in [k for k, (ts, _) in list(_jwks_cache.items()) if now - ts >= _JWKS_TTL]:
+        del _jwks_cache[stale]
+    if len(_jwks_cache) >= _JWKS_CACHE_MAX_SIZE:
+        oldest = min(_jwks_cache, key=lambda k: _jwks_cache[k][0])
+        del _jwks_cache[oldest]
+
+    _jwks_cache[tenant_id] = (now, data)
     logger.debug("auth.jwks.refreshed", tenant_id=tenant_id, key_count=len(data.get("keys", [])))
     return data
 

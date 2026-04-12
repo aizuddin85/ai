@@ -13,6 +13,10 @@ from fastapi import HTTPException
 
 from api.auth.azure_ad import (
     AuthenticatedUser,
+    _JWKS_CACHE_MAX_SIZE,
+    _JWKS_TTL,
+    _get_jwks,
+    _jwks_cache,
     _validate_token,
 )
 
@@ -158,3 +162,110 @@ def test_me_endpoint_requires_auth() -> None:
     # No Authorization header → 403 (HTTPBearer returns 403 when missing)
     resp = client.get("/api/auth/me")
     assert resp.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# JWKS cache — session isolation guarantees
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_jwks_cache() -> None:  # type: ignore[return]
+    """Wipe the module-level JWKS cache before and after each test."""
+    _jwks_cache.clear()
+    yield
+    _jwks_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_jwks_cache_hit_avoids_network() -> None:
+    """A warm cache entry within TTL must not trigger a network fetch."""
+    _jwks_cache["tenant-a"] = (time.time(), {"keys": [{"kid": "k1"}]})
+
+    with patch("api.auth.azure_ad.httpx.AsyncClient") as mock_http:
+        result = await _get_jwks("tenant-a")
+
+    mock_http.assert_not_called()
+    assert result["keys"][0]["kid"] == "k1"
+
+
+@pytest.mark.asyncio
+async def test_jwks_cache_miss_fetches_and_stores() -> None:
+    """A cold cache triggers a network fetch and stores the result."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"keys": [{"kid": "fresh"}]}
+    mock_resp.raise_for_status = MagicMock()
+
+    mock_http = AsyncMock()
+    mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+    mock_http.__aexit__ = AsyncMock(return_value=False)
+    mock_http.get = AsyncMock(return_value=mock_resp)
+
+    with patch("api.auth.azure_ad.httpx.AsyncClient", return_value=mock_http):
+        result = await _get_jwks("tenant-b")
+
+    assert result["keys"][0]["kid"] == "fresh"
+    assert "tenant-b" in _jwks_cache
+
+
+@pytest.mark.asyncio
+async def test_jwks_cache_expired_entry_is_replaced() -> None:
+    """An entry older than _JWKS_TTL is treated as a cache miss."""
+    old_ts = time.time() - _JWKS_TTL - 1
+    _jwks_cache["tenant-c"] = (old_ts, {"keys": [{"kid": "stale"}]})
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"keys": [{"kid": "refreshed"}]}
+    mock_resp.raise_for_status = MagicMock()
+
+    mock_http = AsyncMock()
+    mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+    mock_http.__aexit__ = AsyncMock(return_value=False)
+    mock_http.get = AsyncMock(return_value=mock_resp)
+
+    with patch("api.auth.azure_ad.httpx.AsyncClient", return_value=mock_http):
+        result = await _get_jwks("tenant-c")
+
+    assert result["keys"][0]["kid"] == "refreshed"
+
+
+@pytest.mark.asyncio
+async def test_jwks_cache_bounded_by_max_size() -> None:
+    """Cache must never grow beyond _JWKS_CACHE_MAX_SIZE entries."""
+    # Fill the cache with _JWKS_CACHE_MAX_SIZE entries (all fresh)
+    now = time.time()
+    for i in range(_JWKS_CACHE_MAX_SIZE):
+        _jwks_cache[f"tenant-fill-{i}"] = (now, {"keys": []})
+
+    assert len(_jwks_cache) == _JWKS_CACHE_MAX_SIZE
+
+    # Adding one more tenant must evict the oldest so size stays bounded
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"keys": []}
+    mock_resp.raise_for_status = MagicMock()
+
+    mock_http = AsyncMock()
+    mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+    mock_http.__aexit__ = AsyncMock(return_value=False)
+    mock_http.get = AsyncMock(return_value=mock_resp)
+
+    with patch("api.auth.azure_ad.httpx.AsyncClient", return_value=mock_http):
+        await _get_jwks("tenant-overflow")
+
+    assert len(_jwks_cache) == _JWKS_CACHE_MAX_SIZE
+    assert "tenant-overflow" in _jwks_cache
+
+
+@pytest.mark.asyncio
+async def test_jwks_cache_isolates_tenants() -> None:
+    """Each tenant gets its own JWKS entry — no cross-tenant data mixing."""
+    _jwks_cache["tenant-x"] = (time.time(), {"keys": [{"kid": "x-key"}]})
+    _jwks_cache["tenant-y"] = (time.time(), {"keys": [{"kid": "y-key"}]})
+
+    with patch("api.auth.azure_ad.httpx.AsyncClient") as mock_http:
+        result_x = await _get_jwks("tenant-x")
+        result_y = await _get_jwks("tenant-y")
+
+    mock_http.assert_not_called()
+    assert result_x["keys"][0]["kid"] == "x-key"
+    assert result_y["keys"][0]["kid"] == "y-key"

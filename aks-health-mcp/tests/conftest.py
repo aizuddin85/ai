@@ -28,8 +28,15 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _clear_settings_cache() -> None:
-    """Clear the lru_cache on Settings so env changes take effect."""
+    """
+    Clear all lru_cache singletons before and after every test so that
+    monkeypatched env vars are picked up by Settings/ApiSettings and no
+    cached state leaks between tests.
+    """
     from server.config import get_settings
+    from api.config import get_api_settings
     get_settings.cache_clear()
+    get_api_settings.cache_clear()
     yield
     get_settings.cache_clear()
+    get_api_settings.cache_clear()
